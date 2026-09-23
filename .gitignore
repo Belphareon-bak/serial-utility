@@ -1,0 +1,9 @@
+# uživatelské nastavení okna (cesty, motiv) - vzniká při prvním zavření
+settings.json
+
+# protokoly provedených dávek a jejich vrácení
+logs/
+*.undone
+
+# spouštěč se sestaví z build-exe.ps1, do gitu binárku netaháme
+MediaTool.exe
