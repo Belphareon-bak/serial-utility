@@ -78,20 +78,33 @@ $SubExt   = @('.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx')
 $SkipDirs = @('@eaDir', '#recycle', '#snapshot', '$RECYCLE.BIN',
               'System Volume Information', '.git', '_Duplicity', '_Kekontrole')
 
-# technicke tagy, ktere se z nazvu vyhazuji
-$TagPattern = '^(?:' + (@(
-    '\d{3,4}p', '4k', 'uhd', 'hd', 'sd',
-    'web', 'web-?dl', 'dl', 'webrip', 'bluray', 'blu-?ray', 'blu', 'ray', 'bdrip', 'brrip', 'bdremux',
-    'hdtv', 'dvdrip', 'dvd', 'remux', 'hdr', 'hdr10', 'dv', 'sdr',
+# Technicke tagy se deli na dve skupiny.
+#
+# JEDNOZNACNE nejsou zaroven beznymi slovy, takze se vyhazuji z cele delky nazvu.
+$TagPatternStrict = '^(?:' + (@(
+    '\d{3,4}p', '4k', 'uhd',
+    'web-?dl', 'webrip', 'bluray', 'blu-?ray', 'bdrip', 'brrip', 'bdremux',
+    'hdtv', 'dvdrip', 'dvd', 'remux', 'hdr', 'hdr10', 'sdr',
     'x264', 'x265', 'h\.?264', 'h\.?265', 'hevc', 'avc', 'xvid', 'divx',
     'aac', 'aac2', 'ac3', 'eac3', 'dts', 'dtshd', 'ddp?\d?(?:\.\d)?', '\d\.\d',
-    'atmos', 'truehd', 'flac', 'mp3', 'opus',
-    'hmax', 'amzn', 'nf', 'dsnp', 'max', 'hulu', 'atvp', 'pcok',
-    'proper', 'repack', 'internal', 'extended', 'uncut', 'unrated', 'limited',
-    'multi', 'dual', 'complete', 'ws', 'rip', 'remastered',
-    'cz', 'sk', 'en', 'cze', 'slo', 'eng', 'czech', 'cesky', 'ceske',
-    'czsken', 'czskeng', 'dabing', 'dab', 'dabbing',
-    'titulky', 'tit', 'cztit', 'sub', 'subs', 'subbed', 'forced', 'hardsub'
+    'atmos', 'truehd', 'flac', 'mp3',
+    'hmax', 'amzn', 'dsnp', 'atvp', 'pcok',
+    'repack', 'remastered',
+    'cze', 'slo', 'eng', 'czech', 'cesky', 'ceske',
+    'czsken', 'czskeng', 'dabing', 'dabbing',
+    'titulky', 'cztit', 'subs', 'subbed', 'hardsub',
+    'cz', 'sk', 'en', 'dab', 'tit', 'forced'
+) -join '|') + ')$'
+
+# DVOJZNACNE jsou zaroven bezna slova a objevuji se v nazvech filmu i serialu:
+# "Mad Max", "Ray", "Blu", "Sub Zero", "Dual Survival", "Complete Unknown",
+# "The Limited", "En attendant Godot", "Mr. Holland's Opus".
+# Vyhazuji se proto JEN z casti za rokem nebo za SxxEyy, kde uz nazev byt nemuze.
+# Pred rokem zustavaji - radeji v nazvu jeden zbytecny tag nez utrzeny nazev.
+$TagPatternLoose = '^(?:' + (@(
+    'hd', 'sd', 'web', 'dl', 'blu', 'ray', 'dv', 'nf', 'max', 'hulu', 'opus',
+    'proper', 'internal', 'extended', 'uncut', 'unrated', 'limited',
+    'multi', 'dual', 'complete', 'ws', 'rip', 'sub'
 ) -join '|') + ')$'
 
 # rip skupiny a vlastni smeti - sem si pridavej dalsi
@@ -120,9 +133,12 @@ function Test-SkippedPath {
 }
 
 function Remove-Tags {
-    # vyhodi z textu technicke tagy, rip skupiny a zbytky zavorek
-    param([string]$Text)
+    # vyhodi z textu technicke tagy, rip skupiny a zbytky zavorek.
+    # -Trailing zapina i dvojznacne tagy - pouziva se jen na cast za rokem nebo
+    # za SxxEyy, kde uz nazev dila byt nemuze.
+    param([string]$Text, [switch]$Trailing)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $tagRx = if ($Trailing) { $TagPatternStrict + '|' + $TagPatternLoose } else { $TagPatternStrict }
 
     $t = $Text -replace '~[A-Za-z0-9]+', ' '
     $t = $t -replace '\[[^\]]*\]', ' '
@@ -137,7 +153,7 @@ function Remove-Tags {
         $bare = $tok.Trim('.', '(', ')', '[', ']', '-', '_')
         if ([string]::IsNullOrWhiteSpace($bare)) { continue }
         if ($DropWords -contains $bare.ToLowerInvariant()) { continue }
-        if ($bare -match $TagPattern) { continue }
+        if ($bare -match $tagRx) { continue }
 
         # slozene tokeny typu x264-CZ_SK_EN nebo WEB-DL
         $parts = $bare -split '[-_]'
@@ -145,7 +161,7 @@ function Remove-Tags {
             $allTags = $true
             foreach ($p in $parts) {
                 if ([string]::IsNullOrWhiteSpace($p)) { continue }
-                if ($p -notmatch $TagPattern -and $DropWords -notcontains $p.ToLowerInvariant()) {
+                if ($p -notmatch $tagRx -and $DropWords -notcontains $p.ToLowerInvariant()) {
                     $allTags = $false
                     break
                 }
@@ -154,7 +170,16 @@ function Remove-Tags {
         }
         $keep.Add($bare)
     }
-    return ($keep -join ' ')
+
+    # Pojistka: kdyz v puvodnim textu byla pismena a po vyhazeni tagu nezbylo
+    # zadne, byl odstranen samotny nazev. V takovem pripade se nemeni nic.
+    # V koncove casti (-Trailing) pojistka neplati - tam je prazdny vysledek
+    # spravna odpoved, protoze za SxxEyy nebo za rokem byva jen technicky balast.
+    $vysledek = ($keep -join ' ')
+    if (-not $Trailing -and $t -match '\p{L}' -and $vysledek -notmatch '\p{L}') {
+        return $t.Trim()
+    }
+    return $vysledek
 }
 
 function Format-Title {
@@ -176,8 +201,8 @@ function Format-Title {
 function Get-CleanSegment {
     # poradi je dulezite: nejdriv useknout nedovrenou zavorku a poradove cislo,
     # teprve pak vyhazovat tagy (jinak zmizi zavorka, podle ktere se seka)
-    param([string]$Text)
-    return (Format-Title (Remove-Tags (Format-Title $Text)))
+    param([string]$Text, [switch]$Trailing)
+    return (Format-Title (Remove-Tags (Format-Title $Text) -Trailing:$Trailing))
 }
 
 function Resolve-ShowAlias {
@@ -270,7 +295,7 @@ function ConvertFrom-MediaName {
         $item.Season  = [int]$m.Groups['s'].Value
         $item.Episode = [int]$m.Groups['e'].Value
         $item.Show    = Resolve-ShowAlias (Get-CleanSegment $work.Substring(0, $m.Index))
-        $item.Title   = Get-CleanSegment $work.Substring($m.Index + $m.Length)
+        $item.Title   = Get-CleanSegment $work.Substring($m.Index + $m.Length) -Trailing
         if ([string]::IsNullOrWhiteSpace($item.Show)) {
             $item.Show   = 'Neznamy serial'
             $item.Review = $true
@@ -279,7 +304,8 @@ function ConvertFrom-MediaName {
     }
 
     # --- film: posledni ctyrcisli rok
-    $years = [regex]::Matches($work, '(?<![0-9])(?<y>19\d{2}|20\d{2})(?![0-9])')
+    # (?![xX]\d) odfiltruje rozliseni - v "1920x800p" neni 1920 rok
+    $years = [regex]::Matches($work, '(?<![0-9])(?<y>19\d{2}|20\d{2})(?![0-9])(?![xX]\d)')
     if ($years.Count -gt 0) {
         $last = $years[$years.Count - 1]
         $item.Kind  = 'Film'
@@ -288,7 +314,7 @@ function ConvertFrom-MediaName {
         # "(31) 2022 Black Panther ..." - pred rokem je jen poradove cislo
         if ($item.Title -notmatch '\p{L}') {
             # rok byl na zacatku nazvu - zkus text za nim
-            $item.Title  = Get-CleanSegment $work.Substring($last.Index + 4)
+            $item.Title  = Get-CleanSegment $work.Substring($last.Index + 4) -Trailing
             $item.Review = $true
             if ([string]::IsNullOrWhiteSpace($item.Title)) {
                 $item.Title = Get-CleanSegment $work
