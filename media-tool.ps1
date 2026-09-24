@@ -107,6 +107,22 @@ $TagPatternLoose = '^(?:' + (@(
     'multi', 'dual', 'complete', 'ws', 'rip', 'sub'
 ) -join '|') + ')$'
 
+# jazyk titulku na konci nazvu -> kod, ktery ctou prehravace (Film (2015).cs.srt)
+$SubLang = @{
+    'cz' = 'cs'; 'cze' = 'cs'; 'ces' = 'cs'; 'cs' = 'cs'
+    'sk' = 'sk'; 'slo' = 'sk'; 'slk' = 'sk'
+    'en' = 'en'; 'eng' = 'en'
+    'de' = 'de'; 'ger' = 'de'; 'deu' = 'de'
+    'pl' = 'pl'; 'pol' = 'pl'
+}
+
+# znacky ceske/slovenske jazykove verze v puvodnim nazvu videa
+$DubMarkers = @{
+    'cz' = 'cz'; 'cze' = 'cz'; 'czech' = 'cz'; 'cesky' = 'cz'; 'ceske' = 'cz'
+    'dabing' = 'cz'; 'dab' = 'cz'; 'czdab' = 'cz'; 'czsken' = 'cz'; 'czskeng' = 'cz'
+    'sk' = 'sk'; 'slo' = 'sk'
+}
+
 # rip skupiny a vlastni smeti - sem si pridavej dalsi
 $DropWords = @('chmeli', 'jdm', 'ffi', 'rarbg', 'yify', 'yts', 'evo', 'ntb')
 
@@ -114,6 +130,7 @@ $DropWords = @('chmeli', 'jdm', 'ffi', 'rarbg', 'yify', 'yts', 'evo', 'ntb')
 # Pattern se testuje na rozebrany nazev serialu (bez ohledu na velikost pismen).
 $ShowAliases = @(
     @{ Pattern = '^game[ ._]?of[ ._]?thrones'; Name = 'Game of Thrones' }
+    @{ Pattern = '^cali$'; Name = 'Californication' }   # 6. serie je v knihovne jako cali.s6xNN
 )
 
 # ------------------------------------------------------------------- pomocne
@@ -232,6 +249,24 @@ function ConvertFrom-MediaName {
     $base = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
     $copy = 0
 
+    # Jazyk titulku ("Film.2015.cz.srt") se zachova jako "Film (2015).cs.srt". Bez toho
+    # se ze .cz.srt a .en.srt stanou "Film (2015).srt" a "Film (2015) (2).srt" a nepozna
+    # se, ktere jsou ktere; prehravace navic jazyk titulku ctou prave z teto pripony.
+    $lang = ''
+    if ($SubExt -contains $File.Extension.ToLowerInvariant()) {
+        $ml = [regex]::Match($base, '[.\s_-](?<l>[A-Za-z]{2,3})$')
+        if ($ml.Success -and $SubLang.ContainsKey($ml.Groups['l'].Value.ToLowerInvariant())) {
+            $lang = $SubLang[$ml.Groups['l'].Value.ToLowerInvariant()]
+            $base = $base.Substring(0, $ml.Index)
+        }
+    }
+
+    # Jazykova verze videa (cesky dabing ano/ne) - dve ruzne jazykove verze tehoz dilu
+    # nejsou duplicity, i kdyz maji jina data. Urcuje se z puvodniho nazvu, pred cistenim.
+    $dub = @(($base -split '[\s._+\-()\[\],]+') | ForEach-Object { $_.ToLowerInvariant() } |
+             Where-Object { $DubMarkers.ContainsKey($_) } | ForEach-Object { $DubMarkers[$_] } |
+             Sort-Object -Unique) -join ','
+
     # kopie typu " (1)" - jen pokud existuje i original bez cisla.
     # Kdyz original neexistuje, je cislo soucasti nazvu (ctyri ruzne
     # "Deleted Scene (1..4)") a musi se do noveho nazvu vratit.
@@ -281,14 +316,19 @@ function ConvertFrom-MediaName {
         Note    = ''
         Hash    = ''
         DupOf   = ''
+        DupOfPath = ''
+        DupTyp  = ''
         NewName = ''
         IsSub   = ($SubExt -contains $File.Extension.ToLowerInvariant())
+        Lang    = $lang
+        Dub     = $dub
     }
 
     # --- serial: SxxEyy nebo 1x02
     $m = [regex]::Match($work, '(?<![A-Za-z0-9])[Ss](?<s>\d{1,2})[\s._-]*[Ee](?<e>\d{1,3})(?![0-9])')
     if (-not $m.Success) {
-        $m = [regex]::Match($work, '(?<![A-Za-z0-9])(?<s>\d{1,2})x(?<e>\d{2,3})(?![0-9])')
+        # [Ss]? pokryje i smiseny zapis "s6x01", ktery se v knihovne vyskytuje
+        $m = [regex]::Match($work, '(?<![A-Za-z0-9])[Ss]?(?<s>\d{1,2})x(?<e>\d{2,3})(?![0-9])')
     }
     if ($m.Success) {
         $item.Kind    = 'Serial'
@@ -371,7 +411,8 @@ function Format-NameTemplate {
         $num = $sfx.Trim(' ', '(', ')')
         if ($n -match ('[\s(]' + [regex]::Escape($num) + '\)?$')) { $sfx = '' }
     }
-    return (New-SafeName ($n + $sfx)) + $Item.File.Extension.ToLowerInvariant()
+    $jazyk = if ($Item.Lang) { '.' + $Item.Lang } else { '' }
+    return (New-SafeName ($n + $sfx)) + $jazyk + $Item.File.Extension.ToLowerInvariant()
 }
 
 function Get-QuickHash {
@@ -401,6 +442,12 @@ function Get-QuickHash {
     }
 }
 
+function Test-SameVolume {
+    # stejny koren = presun je jen prejmenovani; jinak se kopiruje a overuje
+    param([string]$Source, [string]$Target)
+    return ([System.IO.Path]::GetPathRoot($Source) -eq [System.IO.Path]::GetPathRoot($Target))
+}
+
 function Move-FileSafe {
     # presun odolny vuci NAS: mezi svazky kopie + overeni + smazani zdroje
     param([string]$Source, [string]$Target)
@@ -413,10 +460,7 @@ function Move-FileSafe {
         throw "cilova cesta je prilis dlouha ($($Target.Length) znaku)"
     }
 
-    $srcRoot = [System.IO.Path]::GetPathRoot($Source)
-    $dstRoot = [System.IO.Path]::GetPathRoot($Target)
-
-    if ($srcRoot -eq $dstRoot) {
+    if (Test-SameVolume $Source $Target) {
         Move-Item -LiteralPath $Source -Destination $Target
         return
     }
@@ -430,6 +474,14 @@ function Move-FileSafe {
     if ($a -ne $b) {
         Remove-Item -LiteralPath $tmp -Force
         throw "kopie nesouhlasi velikosti ($a vs $b), zdroj ponechan"
+    }
+    # Shodna delka nestaci - poskozena kopie (chyba site, pameti, disku) ma stejnou
+    # delku a po smazani zdroje by zustala jako jedina. Porovnava se cely obsah.
+    $ha = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+    $hb = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    if ($ha -ne $hb) {
+        Remove-Item -LiteralPath $tmp -Force
+        throw "kopie nesouhlasi obsahem (SHA-256), zdroj ponechan"
     }
     Rename-Item -LiteralPath $tmp -NewName (Split-Path $Target -Leaf)
     Remove-Item -LiteralPath $Source -Force
@@ -530,7 +582,7 @@ function Add-Duplicates {
             Select-Object -First 1
         foreach ($i in $g.Group) {
             [void]$seen.Add($i.File.FullName)
-            if ($i -ne $keep) { $i.DupOf = $keep.File.Name }
+            if ($i -ne $keep) { $i.DupOf = $keep.File.Name; $i.DupOfPath = $keep.File.FullName; $i.DupTyp = 'shodna data' }
         }
         $groups.Add([pscustomobject]@{ Typ = 'shodna data'; Keep = $keep; All = $g.Group })
     }
@@ -538,13 +590,13 @@ function Add-Duplicates {
     # 2) logicka duplicita: stejny dil serialu, ale jina data (jiny rip)
     foreach ($g in ($Items |
                     Where-Object { $_.Kind -eq 'Serial' -and -not $_.IsSub } |
-                    Group-Object { "$($_.Show.ToLowerInvariant())|$($_.Season)|$($_.Episode)" })) {
+                    Group-Object { "$($_.Show.ToLowerInvariant())|$($_.Season)|$($_.Episode)|$($_.Dub)" })) {
         if ($g.Count -lt 2) { continue }
         $novy = @($g.Group | Where-Object { -not $seen.Contains($_.File.FullName) })
         if ($novy.Count -lt 1) { continue }
         $keep = $g.Group | Sort-Object @{ E = { $_.File.Length }; Descending = $true } | Select-Object -First 1
         foreach ($i in $g.Group) {
-            if ($i -ne $keep -and -not $i.DupOf) { $i.DupOf = $keep.File.Name }
+            if ($i -ne $keep -and -not $i.DupOf) { $i.DupOf = $keep.File.Name; $i.DupOfPath = $keep.File.FullName; $i.DupTyp = 'stejny dil, jina data' }
         }
         $groups.Add([pscustomobject]@{ Typ = 'stejny dil, jina data'; Keep = $keep; All = $g.Group })
     }
@@ -576,9 +628,9 @@ function New-Plan {
         if ($i.DupOf) {
             if ($Command -eq 'sort') {
                 $t = Get-UniqueTarget (Join-Path (Join-Path $Library '_Duplicity') $i.File.Name) $taken
-                $plan.Add([pscustomobject]@{ Akce = 'DUPLICITA'; Duvod = "kopie: $($i.DupOf)"; Zdroj = $src; Cil = $t })
+                $plan.Add([pscustomobject]@{ Akce = 'DUPLICITA'; Duvod = "kopie: $($i.DupOf)"; Zdroj = $src; Cil = $t; Ponechat = $i.DupOfPath; Typ = $i.DupTyp })
             } else {
-                $plan.Add([pscustomobject]@{ Akce = 'DUPLICITA'; Duvod = "kopie: $($i.DupOf)"; Zdroj = $src; Cil = '' })
+                $plan.Add([pscustomobject]@{ Akce = 'DUPLICITA'; Duvod = "kopie: $($i.DupOf)"; Zdroj = $src; Cil = ''; Ponechat = $i.DupOfPath; Typ = $i.DupTyp })
             }
             continue
         }
@@ -634,6 +686,86 @@ function Show-Plan {
     }
 }
 
+function Invoke-MoveBatch {
+    # Provede presuny Zdroj -> Cil. Kazdy hotovy presun se HNED pripise do logu,
+    # ne az na konci davky - kdyz skript spadne nebo se zavre uprostred, zustane
+    # zaznam o vsem, co uz se presunulo, a davka jde vratit.
+    # Pouziva ji prikazova radka i GUI, aby existovala jedina implementace.
+    param([object[]]$Rows, [string]$LogPath, [scriptblock]$OnProgress)
+    $done   = New-Object System.Collections.Generic.List[object]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $logDir = Split-Path $LogPath -Parent
+    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $n = 0
+    foreach ($r in $Rows) {
+        $n++
+        try {
+            Move-FileSafe -Source $r.Zdroj -Target $r.Cil
+            $row = [pscustomobject]@{ Cas = (Get-Date).ToString('s'); Akce = $r.Akce; Zdroj = $r.Zdroj; Cil = $r.Cil }
+            $done.Add($row)
+            $row | Export-Csv -LiteralPath $LogPath -NoTypeInformation -Encoding UTF8 -Append
+        } catch {
+            $errors.Add("$(Split-Path $r.Zdroj -Leaf): $($_.Exception.Message)")
+        }
+        if ($OnProgress) { & $OnProgress $n $Rows.Count $r }
+    }
+    return [pscustomobject]@{ Done = $done; Errors = $errors }
+}
+
+function Invoke-UndoBatch {
+    # Vrati davku z logu. Za vracenou (.undone) se oznaci JEN kdyz se vratilo vse.
+    # Jinak v logu zustanou soubory, ktere se vratit nepodarilo, a dalsi vraceni
+    # zkusi znovu presne je - ne starsi davku, jak se to delo driv.
+    param([System.IO.FileInfo]$Log, [scriptblock]$OnProgress)
+    $rows = @(Import-Csv -LiteralPath $Log.FullName)
+    [array]::Reverse($rows)
+    $zbyva  = New-Object System.Collections.Generic.List[object]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $ok = 0; $n = 0
+    foreach ($r in $rows) {
+        $n++
+        if (-not (Test-Path -LiteralPath $r.Cil)) {
+            # uz je zpet na puvodnim miste = v poradku; jinak o nem ztracime prehled
+            if (-not (Test-Path -LiteralPath $r.Zdroj)) {
+                $errors.Add("chybi: $($r.Cil)")
+                $zbyva.Add($r)
+            }
+        } else {
+            try { Move-FileSafe -Source $r.Cil -Target $r.Zdroj; $ok++ }
+            catch { $errors.Add("$(Split-Path $r.Cil -Leaf): $($_.Exception.Message)"); $zbyva.Add($r) }
+        }
+        if ($OnProgress) { & $OnProgress $n $rows.Count $r }
+    }
+    if ($zbyva.Count -eq 0) {
+        Rename-Item -LiteralPath $Log.FullName -NewName ($Log.Name + '.undone')
+    } else {
+        $zbyva.Reverse()
+        $zbyva | Export-Csv -LiteralPath $Log.FullName -NoTypeInformation -Encoding UTF8
+    }
+    return [pscustomobject]@{ Restored = $ok; Errors = $errors; Remaining = $zbyva.Count }
+}
+
+function Test-DuplicateDeletable {
+    # Vraci $null, kdyz lze duplicitu smazat; jinak duvod, proc ne.
+    # Kontroluje se az v okamziku mazani - nahled muze byt hodinu stary a ponechana
+    # kopie mezitim zmizet. U "shodnych dat" se porovna CELY obsah: shoda se ve vychozim
+    # rezimu pocita jen z prvniho a posledniho MB, a to na trvale smazani nestaci.
+    param([string]$Zdroj, [string]$Ponechat, [string]$Typ)
+    if ([string]::IsNullOrWhiteSpace($Ponechat)) { return 'neni znama ponechana kopie' }
+    if ($Ponechat -eq $Zdroj) { return 'ponechana kopie je tentyz soubor' }
+    if (-not (Test-Path -LiteralPath $Zdroj)) { return 'duplicita uz neexistuje' }
+    if (-not (Test-Path -LiteralPath $Ponechat)) { return "ponechana kopie chybi: $Ponechat" }
+    if ($Typ -eq 'shodna data') {
+        if ((Get-Item -LiteralPath $Zdroj).Length -ne (Get-Item -LiteralPath $Ponechat).Length) {
+            return 'ponechana kopie ma jinou velikost'
+        }
+        $ha = (Get-FileHash -LiteralPath $Zdroj -Algorithm SHA256).Hash
+        $hb = (Get-FileHash -LiteralPath $Ponechat -Algorithm SHA256).Hash
+        if ($ha -ne $hb) { return 'ponechana kopie ma jiny obsah (shoda byla jen podle zacatku a konce souboru)' }
+    }
+    return $null
+}
+
 function Invoke-Plan {
     param([System.Collections.Generic.List[object]]$Plan)
 
@@ -643,26 +775,16 @@ function Invoke-Plan {
         return
     }
 
-    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-    $log  = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
-    $done = New-Object System.Collections.Generic.List[object]
-
-    $n = 0
-    foreach ($p in $todo) {
-        $n++
-        Write-Progress -Activity 'MediaTool' -Status "$n / $($todo.Count): $(Split-Path $p.Zdroj -Leaf)" -PercentComplete (100 * $n / $todo.Count)
-        try {
-            Move-FileSafe -Source $p.Zdroj -Target $p.Cil
-            $done.Add([pscustomobject]@{ Cas = (Get-Date).ToString('s'); Akce = $p.Akce; Zdroj = $p.Zdroj; Cil = $p.Cil })
-        } catch {
-            Write-Warning "$(Split-Path $p.Zdroj -Leaf): $($_.Exception.Message)"
-        }
+    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+    $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
+        param($n, $total, $r)
+        Write-Progress -Activity 'MediaTool' -Status "$n / $total`: $(Split-Path $r.Zdroj -Leaf)" -PercentComplete (100 * $n / $total)
     }
     Write-Progress -Activity 'MediaTool' -Completed
+    foreach ($e in $res.Errors) { Write-Warning $e }
 
-    if ($done.Count -gt 0) {
-        $done | Export-Csv -LiteralPath $log -NoTypeInformation -Encoding UTF8
-        Write-Host "`nHotovo: $($done.Count) souboru. Log: $log" -ForegroundColor Green
+    if ($res.Done.Count -gt 0) {
+        Write-Host "`nHotovo: $($res.Done.Count) souboru. Log: $log" -ForegroundColor Green
         Write-Host 'Vratit zpet:  .\media-tool.ps1 undo -Apply' -ForegroundColor DarkGray
     }
 }
@@ -673,26 +795,25 @@ function Invoke-Undo {
     if (-not $log) { Write-Host 'Zadny log k vraceni.'; return }
 
     $rows = @(Import-Csv -LiteralPath $log.FullName)
-    [array]::Reverse($rows)
     Write-Head "Vraceni davky $($log.Name) - $($rows.Count) souboru"
 
-    foreach ($r in $rows) {
-        if (-not (Test-Path -LiteralPath $r.Cil)) {
-            Write-Warning "chybi (uz presunuto jinam?): $($r.Cil)"
-            continue
+    if (-not $Apply) {
+        [array]::Reverse($rows)
+        foreach ($r in $rows) {
+            Write-Host "  $(Split-Path $r.Cil -Leaf)"
+            Write-Host "    -> $($r.Zdroj)" -ForegroundColor Green
         }
-        Write-Host "  $(Split-Path $r.Cil -Leaf)"
-        Write-Host "    -> $($r.Zdroj)" -ForegroundColor Green
-        if ($Apply) {
-            try { Move-FileSafe -Source $r.Cil -Target $r.Zdroj }
-            catch { Write-Warning $_.Exception.Message }
-        }
+        Write-Host "`n(nahled - pro provedeni pridej -Apply)" -ForegroundColor Yellow
+        return
     }
-    if ($Apply) {
-        Rename-Item -LiteralPath $log.FullName -NewName ($log.Name + '.undone')
+
+    $res = Invoke-UndoBatch -Log $log
+    foreach ($e in $res.Errors) { Write-Warning $e }
+    if ($res.Remaining -eq 0) {
         Write-Host "`nVraceno." -ForegroundColor Green
     } else {
-        Write-Host "`n(nahled - pro provedeni pridej -Apply)" -ForegroundColor Yellow
+        Write-Host "`nVraceno jen castecne: $($res.Remaining) souboru se vratit nepodarilo." -ForegroundColor Yellow
+        Write-Host "Zustavaji v logu $($log.Name); po odstraneni prekazky spust undo znovu." -ForegroundColor Yellow
     }
 }
 

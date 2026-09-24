@@ -613,26 +613,17 @@ function Invoke-Apply {
     Set-Busy $true 'Pracuji...'
     $pb.Value = 0; $pb.Maximum = $todo.Count; $pb.Visible = $true
 
-    $done  = New-Object System.Collections.Generic.List[object]
-    $chyby = New-Object System.Collections.Generic.List[string]
-    $n = 0
-    foreach ($t in $todo) {
-        $n++
-        try {
-            Move-FileSafe -Source $t.Zdroj -Target $t.Cil
-            $done.Add([pscustomobject]@{
-                Cas = (Get-Date).ToString('s'); Akce = $t.Akce; Zdroj = $t.Zdroj; Cil = $t.Cil })
-        } catch { $chyby.Add("$(Split-Path $t.Zdroj -Leaf): $($_.Exception.Message)") }
+    # Invoke-MoveBatch (jadro) zapisuje log po kazdem presunu - kdyz se okno zavre
+    # nebo pocitac vypne uprostred davky, jde to, co uz se presunulo, vratit.
+    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+    $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
+        param($n, $total, $r)
         $pb.Value = $n
-        $lblStatus.Text = "$n / $($todo.Count) - $(Split-Path $t.Zdroj -Leaf)"
+        $lblStatus.Text = "$n / $total - $(Split-Path $r.Zdroj -Leaf)"
         [System.Windows.Forms.Application]::DoEvents()
     }
-
-    if ($done.Count -gt 0) {
-        if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-        $done | Export-Csv -LiteralPath (Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))) `
-                -NoTypeInformation -Encoding UTF8
-    }
+    $done  = $res.Done
+    $chyby = $res.Errors
 
     $pb.Visible = $false
     Set-Busy $false "Hotovo: $($done.Count) souborů, chyb: $($chyby.Count)."
@@ -683,8 +674,15 @@ function Invoke-DeleteDuplicates {
     $n = 0
     foreach ($t in $todo) {
         $n++
+        # Nahled muze byt stary: tesne pred smazanim overit, ze ponechana kopie existuje
+        # a u shodnych dat ma stejny obsah. Bez toho mohly zmizet vsechny kopie.
+        $radekPlanu = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
+                      Select-Object -First 1
+        $proc = Test-DuplicateDeletable -Zdroj $t.Zdroj -Ponechat $radekPlanu.Ponechat -Typ $radekPlanu.Typ
         try {
-            if (Test-Path -LiteralPath $t.Zdroj) {
+            if ($proc) {
+                $chyby.Add("$(Split-Path $t.Zdroj -Leaf): NESMAZANO - $proc")
+            } elseif (Test-Path -LiteralPath $t.Zdroj) {
                 if ($trvale) {
                     Remove-Item -LiteralPath $t.Zdroj -Force
                 } else {
@@ -739,29 +737,25 @@ function Invoke-UndoLast {
         "`n`n(Smazané duplicity tímhle vrátit nejde - ty hledej v Koši.)",
         'MediaTool', 'YesNo', 'Question') -ne 'Yes') { return }
 
-    [array]::Reverse($rows)
     Set-Busy $true 'Vracím...'
     $pb.Value = 0; $pb.Maximum = $rows.Count; $pb.Visible = $true
 
-    $ok = 0
-    $chyby = New-Object System.Collections.Generic.List[string]
-    $n = 0
-    foreach ($r in $rows) {
-        $n++
-        if (Test-Path -LiteralPath $r.Cil) {
-            try { Move-FileSafe -Source $r.Cil -Target $r.Zdroj; $ok++ }
-            catch { $chyby.Add("$(Split-Path $r.Cil -Leaf): $($_.Exception.Message)") }
-        } else { $chyby.Add("chybí: $(Split-Path $r.Cil -Leaf)") }
+    # Invoke-UndoBatch (jadro) oznaci davku za vracenou jen kdyz se vratilo vse.
+    # Driv stacil jediny vraceny soubor a dalsi "Vratit" pak vzalo starsi davku.
+    $res = Invoke-UndoBatch -Log $log -OnProgress {
+        param($n, $total, $r)
         $pb.Value = $n
         [System.Windows.Forms.Application]::DoEvents()
     }
+    $ok    = $res.Restored
+    $chyby = $res.Errors
 
-    if ($ok -gt 0) { Rename-Item -LiteralPath $log.FullName -NewName ($log.Name + '.undone') }
     $pb.Visible = $false
     Set-Busy $false "Vráceno: $ok souborů, chyb: $($chyby.Count)."
     if ($chyby.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show(
-            "Část se vrátit nepodařila:`n`n" + (($chyby | Select-Object -First 15) -join "`n"),
+            "Část se vrátit nepodařila:`n`n" + (($chyby | Select-Object -First 15) -join "`n") +
+            "`n`nDávka zůstává otevřená - po odstranění překážky ji vrať znovu.",
             'MediaTool', 'OK', 'Warning') | Out-Null
     }
 }
