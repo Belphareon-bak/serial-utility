@@ -443,9 +443,57 @@ function Get-QuickHash {
 }
 
 function Test-SameVolume {
-    # stejny koren = presun je jen prejmenovani; jinak se kopiruje a overuje
+    # Stejny koren nestaci: junction a volume mount point mohou vest na jiny disk.
+    # Kdyz identitu svazku nelze prokazat, pouzijeme bezpecnejsi kopii pres .mtpart.
     param([string]$Source, [string]$Target)
-    return ([System.IO.Path]::GetPathRoot($Source) -eq [System.IO.Path]::GetPathRoot($Target))
+    if ([System.IO.Path]::GetPathRoot($Source) -ine [System.IO.Path]::GetPathRoot($Target)) { return $false }
+
+    $srcDir = Split-Path $Source -Parent
+    $dstDir = Split-Path $Target -Parent
+    try {
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            # Kazdy reparse point na ceste muze menit svazek. I symlink do
+            # stejneho svazku vedeme pres overenou kopii, pokud si nejsme jisti.
+            foreach ($path in @($srcDir, $dstDir)) {
+                $dir = [System.IO.DirectoryInfo]::new([System.IO.Path]::GetFullPath($path))
+                while ($null -ne $dir) {
+                    if ((Get-Item -LiteralPath $dir.FullName -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                        return $false
+                    }
+                    $dir = $dir.Parent
+                }
+            }
+            return $true
+        }
+
+        # Linux: mount ID rozlisi i dva bind mounty stejneho filesystemu.
+        # Kanonicke cesty odhali take symbolicke odkazy pres jiny svazek.
+        $readlink = (Get-Command readlink -CommandType Application -ErrorAction Stop).Source
+        $findmnt = (Get-Command findmnt -CommandType Application -ErrorAction Stop).Source
+        $srcReal = & $readlink -f -- $srcDir
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $dstReal = & $readlink -f -- $dstDir
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $srcMount = & $findmnt -n -T $srcReal -o ID
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $dstMount = & $findmnt -n -T $dstReal -o ID
+        if ($LASTEXITCODE -ne 0) { return $false }
+        return (-not [string]::IsNullOrWhiteSpace($srcMount) -and $srcMount -eq $dstMount)
+    } catch {
+        return $false
+    }
+}
+
+function Test-CaseOnlyRename {
+    param([string]$Source, [string]$Target)
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        [string]::IsNullOrWhiteSpace($Source)) { return $false }
+    $sourceDir = Split-Path $Source -Parent
+    $targetDir = Split-Path $Target -Parent
+    $sourceName = Split-Path $Source -Leaf
+    $targetName = Split-Path $Target -Leaf
+    return ($sourceDir -ceq $targetDir -and $sourceName -ieq $targetName -and
+            $sourceName -cne $targetName)
 }
 
 function Move-FileSafe {
@@ -460,6 +508,14 @@ function Move-FileSafe {
         throw "cilova cesta je prilis dlouha ($($Target.Length) znaku)"
     }
 
+    if (Test-CaseOnlyRename $Source $Target) {
+        # Na NTFS cil pri zmene jen velikosti pismen ukazuje na zdroj.
+        # Rename-Item meni pouze jmeno, bez kopie a bez kolize (2).
+        Rename-Item -LiteralPath $Source -NewName (Split-Path $Target -Leaf)
+        return
+    }
+    if (Test-Path -LiteralPath $Target) { throw "cil uz existuje: $Target" }
+
     if (Test-SameVolume $Source $Target) {
         Move-Item -LiteralPath $Source -Destination $Target
         return
@@ -467,7 +523,7 @@ function Move-FileSafe {
 
     # jiny svazek (lokalni disk -> Synology): kopie, overit, teprve pak smazat
     $tmp = "$Target.mtpart"
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    if (Test-Path -LiteralPath $tmp) { throw "docasna kopie uz existuje: $tmp; zdroj ponechan" }
     Copy-Item -LiteralPath $Source -Destination $tmp
     $a = (Get-Item -LiteralPath $Source).Length
     $b = (Get-Item -LiteralPath $tmp).Length
@@ -488,13 +544,15 @@ function Move-FileSafe {
 }
 
 function Get-UniqueTarget {
-    param([string]$Target, [System.Collections.Generic.HashSet[string]]$Taken)
+    param([string]$Target, [System.Collections.Generic.HashSet[string]]$Taken, [string]$Source = '')
     $dir  = Split-Path $Target -Parent
     $name = [System.IO.Path]::GetFileNameWithoutExtension($Target)
     $ext  = [System.IO.Path]::GetExtension($Target)
     $try  = $Target
     $i = 2
-    while ($Taken.Contains($try.ToLowerInvariant()) -or (Test-Path -LiteralPath $try)) {
+    while ($Taken.Contains($try.ToLowerInvariant()) -or
+           ((Test-Path -LiteralPath $try) -and
+            -not (Test-CaseOnlyRename $Source $try))) {
         $try = Join-Path $dir ("$name ($i)$ext")
         $i++
         if ($i -gt 99) { break }
@@ -659,7 +717,7 @@ function New-Plan {
             $plan.Add([pscustomobject]@{ Akce = 'BEZE ZMENY'; Duvod = ''; Zdroj = $src; Cil = '' })
             continue
         }
-        $t = Get-UniqueTarget (Join-Path $i.File.DirectoryName $i.NewName) $taken
+        $t = Get-UniqueTarget (Join-Path $i.File.DirectoryName $i.NewName) $taken $src
         $plan.Add([pscustomobject]@{ Akce = 'PREJMENOVAT'; Duvod = $i.Note; Zdroj = $src; Cil = $t })
     }
 

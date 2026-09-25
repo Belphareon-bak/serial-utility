@@ -109,8 +109,58 @@ $chyba = $null; try { Move-FileSafe -Source "$d/b.mkv" -Target "$d/cil/b.mkv" } 
 Assert-Eq $true ($chyba -like '*SHA-256*') 'poskozena kopie se stejnou delkou je odhalena'
 Assert-Eq $puvodni (Get-FileHash "$d/b.mkv").Hash 'zdroj zustal nedotceny'
 Assert-Eq $false (Test-Path "$d/cil/b.mkv") 'poskozena kopie v cili nezustala'
+New-File "$d/stale.mkv" 300000 9
+New-File "$d/cil/stale.mkv.mtpart" 20 10
+$staleHash = (Get-FileHash "$d/cil/stale.mkv.mtpart" -Algorithm SHA256).Hash
+$chyba = $null; try { Move-FileSafe -Source "$d/stale.mkv" -Target "$d/cil/stale.mkv" } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*docasna kopie uz existuje*') 'stara .mtpart zastavi presun'
+Assert-Eq $staleHash (Get-FileHash "$d/cil/stale.mkv.mtpart" -Algorithm SHA256).Hash 'stara .mtpart zustane nedotcena'
+Assert-Eq $true (Test-Path "$d/stale.mkv") 'zdroj zustane pri kolizi .mtpart'
 Remove-Item Function:\Copy-Item, Function:\Test-SameVolume
 Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Skutecny mount point pres stejny koren cesty"
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -and
+    (Test-Path -LiteralPath /dev/shm) -and
+    -not (Test-SameVolume /tmp/mediatool-source.mkv /dev/shm/mediatool-target.mkv)) {
+    $d = New-TestDir
+    $other = Join-Path /dev/shm ('mt-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $other | Out-Null
+    try {
+        New-File "$d/source.mkv" 300000 29
+        $hash = (Get-FileHash "$d/source.mkv" -Algorithm SHA256).Hash
+        $script:copyDestination = ''
+        function Copy-Item { param($LiteralPath, $Destination)
+            $script:copyDestination = $Destination
+            Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination
+        }
+        Move-FileSafe -Source "$d/source.mkv" -Target "$other/target.mkv"
+        Assert-Eq $true ($script:copyDestination -like '*.mtpart') 'pres mount point se pouzila docasna kopie'
+        Assert-Eq $hash (Get-FileHash "$other/target.mkv" -Algorithm SHA256).Hash 'cil za mount pointem je shodny'
+        Assert-Eq $false (Test-Path "$d/source.mkv") 'zdroj zmizel az po overeni'
+    } finally {
+        Remove-Item Function:\Copy-Item -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $d, $other
+    }
+}
+
+Write-Host "`n== Zmena jen velikosti pismen bez (2)"
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $d = New-TestDir
+    try {
+        $source = Join-Path $d 'Film (2015).MKV'
+        $target = Join-Path $d 'Film (2015).mkv'
+        New-File $source 300000 31
+        $taken = New-Object System.Collections.Generic.HashSet[string]
+        $planned = Get-UniqueTarget $target $taken $source
+        Assert-Eq $target $planned 'plan ponecha pozadovane jmeno bez (2)'
+        Move-FileSafe -Source $source -Target $planned
+        $name = (Get-ChildItem -LiteralPath $d -File | Select-Object -First 1).Name
+        Assert-Eq 'Film (2015).mkv' $name 'prejmenovani opravdu zmenilo velikost pismen'
+    } finally {
+        Remove-Item -Recurse -Force $d
+    }
+}
 
 Write-Host "`n== Kontrola pred smazanim duplicity"
 $d = New-TestDir
