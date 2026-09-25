@@ -76,6 +76,20 @@ $radkuLogu = if (Test-Path $log) { @(Import-Csv $log).Count } else { 0 }
 Assert-Eq 2 $radkuLogu 'log obsahuje prave tyto 2 presuny'
 Remove-Item -Recurse -Force $d
 
+Write-Host "`n== Chyba zapisu logu zastavi dalsi presuny"
+$d = New-TestDir
+1..2 | ForEach-Object { New-File "$d/src/f$_.mkv" }
+$rows = 1..2 | ForEach-Object { [pscustomobject]@{ Akce = 'PRESUN'; Zdroj = "$d/src/f$_.mkv"; Cil = "$d/dst/f$_.mkv" } }
+$log = "$d/logs/mediatool-failed.csv"
+function Export-Csv { throw 'simulovana chyba zapisu logu' }
+try { $res = Invoke-MoveBatch -Rows $rows -LogPath $log }
+finally { Remove-Item Function:\Export-Csv }
+Assert-Eq $true (Test-Path "$d/dst/f1.mkv") 'prvni presun probehl'
+Assert-Eq $true (Test-Path "$d/src/f2.mkv") 'druhy presun se po chybe logu neprovede'
+Assert-Eq 1 $res.Errors.Count 'chyba zapisu se ohlasi'
+Assert-Eq $true ($res.Errors[0] -like '*ZAPIS LOGU SELHAL*') 'chyba upozorni na presun bez spolehliveho logu'
+Remove-Item -Recurse -Force $d
+
 Write-Host "`n== Castecne vraceni neoznaci davku za hotovou"
 $d = New-TestDir
 1..3 | ForEach-Object { New-File "$d/src/f$_.mkv" }
@@ -94,8 +108,24 @@ Assert-Eq $true (Test-Path "$log.undone") 'teprve ted je davka .undone'
 Assert-Eq 3 (@(Get-ChildItem "$d/src").Count) 'vsechny tri soubory jsou zpet'
 Remove-Item -Recurse -Force $d
 
+Write-Host "`n== Zmizely cil a cizi soubor na puvodni ceste"
+$d = New-TestDir
+New-File "$d/src/original.mkv" 300000 41
+$row = [pscustomobject]@{ Akce = 'PRESUN'; Zdroj = "$d/src/original.mkv"; Cil = "$d/dst/original.mkv" }
+$log = "$d/logs/mediatool-20990101-000001.csv"
+Invoke-MoveBatch -Rows @($row) -LogPath $log | Out-Null
+Move-Item "$d/dst/original.mkv" "$d/mimo.mkv"
+New-File "$d/src/original.mkv" 300000 42
+$foreignHash = (Get-FileHash "$d/src/original.mkv" -Algorithm SHA256).Hash
+$res = Invoke-UndoBatch -Log (Get-Item $log)
+Assert-Eq 1 $res.Remaining 'zmizely cil drzi davku otevrenou i kdyz zdrojova cesta existuje'
+Assert-Eq $true (Test-Path $log) 'log neni oznacen .undone'
+Assert-Eq $foreignHash (Get-FileHash "$d/src/original.mkv" -Algorithm SHA256).Hash 'cizi soubor zustal nedotcen'
+Remove-Item -Recurse -Force $d
+
 Write-Host "`n== Presun na jiny svazek overuje obsah"
 $d = New-TestDir
+$originalSameVolume = (Get-Command Test-SameVolume).ScriptBlock
 function Test-SameVolume { $false }                       # vynuti cestu kopie + overeni
 New-File "$d/a.mkv" 300000 7
 Move-FileSafe -Source "$d/a.mkv" -Target "$d/cil/a.mkv"
@@ -116,7 +146,8 @@ $chyba = $null; try { Move-FileSafe -Source "$d/stale.mkv" -Target "$d/cil/stale
 Assert-Eq $true ($chyba -like '*docasna kopie uz existuje*') 'stara .mtpart zastavi presun'
 Assert-Eq $staleHash (Get-FileHash "$d/cil/stale.mkv.mtpart" -Algorithm SHA256).Hash 'stara .mtpart zustane nedotcena'
 Assert-Eq $true (Test-Path "$d/stale.mkv") 'zdroj zustane pri kolizi .mtpart'
-Remove-Item Function:\Copy-Item, Function:\Test-SameVolume
+Remove-Item Function:\Copy-Item
+Set-Item Function:\Test-SameVolume $originalSameVolume
 Remove-Item -Recurse -Force $d
 
 Write-Host "`n== Skutecny mount point pres stejny koren cesty"

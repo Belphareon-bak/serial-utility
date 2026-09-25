@@ -606,15 +606,15 @@ function Invoke-Apply {
     }
 
     $odp = [System.Windows.Forms.MessageBox]::Show(
-        "Provést $($todo.Count) operací?`n`nNic se nemaže. Vrátit to půjde tlačítkem " +
-        '"Vrátit poslední dávku".', 'MediaTool', 'YesNo', 'Question')
+        "Provést $($todo.Count) operací?`n`nDokončené přesuny lze běžně vrátit z logu. " +
+        'Při chybě zápisu logu zkontroluj soubory ručně.', 'MediaTool', 'YesNo', 'Question')
     if ($odp -ne 'Yes') { return }
 
     Set-Busy $true 'Pracuji...'
     $pb.Value = 0; $pb.Maximum = $todo.Count; $pb.Visible = $true
 
-    # Invoke-MoveBatch (jadro) zapisuje log po kazdem presunu - kdyz se okno zavre
-    # nebo pocitac vypne uprostred davky, jde to, co uz se presunulo, vratit.
+    # Invoke-MoveBatch zapisuje log po kazdem presunu, ale mezi presunem a zapisem
+    # zustava mezera. Pri selhani logu je potreba zkontrolovat soubory rucne.
     $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
     $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
         param($n, $total, $r)
@@ -676,10 +676,10 @@ function Invoke-DeleteDuplicates {
         $n++
         # Nahled muze byt stary: tesne pred smazanim overit, ze ponechana kopie existuje
         # a u shodnych dat ma stejny obsah. Bez toho mohly zmizet vsechny kopie.
-        $radekPlanu = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
-                      Select-Object -First 1
-        $proc = Test-DuplicateDeletable -Zdroj $t.Zdroj -Ponechat $radekPlanu.Ponechat -Typ $radekPlanu.Typ
         try {
+            $radekPlanu = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
+                          Select-Object -First 1
+            $proc = Test-DuplicateDeletable -Zdroj $t.Zdroj -Ponechat $radekPlanu.Ponechat -Typ $radekPlanu.Typ
             if ($proc) {
                 $chyby.Add("$(Split-Path $t.Zdroj -Leaf): NESMAZANO - $proc")
             } elseif (Test-Path -LiteralPath $t.Zdroj) {

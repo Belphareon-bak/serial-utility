@@ -745,9 +745,8 @@ function Show-Plan {
 }
 
 function Invoke-MoveBatch {
-    # Provede presuny Zdroj -> Cil. Kazdy hotovy presun se HNED pripise do logu,
-    # ne az na konci davky - kdyz skript spadne nebo se zavre uprostred, zustane
-    # zaznam o vsem, co uz se presunulo, a davka jde vratit.
+    # Provede presuny Zdroj -> Cil. Log se zapisuje po kazdem presunu, ale
+    # pri selhani zapisu nebo padu mezi presunem a logem muze zaznam chybet.
     # Pouziva ji prikazova radka i GUI, aby existovala jedina implementace.
     param([object[]]$Rows, [string]$LogPath, [scriptblock]$OnProgress)
     $done   = New-Object System.Collections.Generic.List[object]
@@ -757,12 +756,18 @@ function Invoke-MoveBatch {
     $n = 0
     foreach ($r in $Rows) {
         $n++
+        $moved = $false
         try {
             Move-FileSafe -Source $r.Zdroj -Target $r.Cil
+            $moved = $true
             $row = [pscustomobject]@{ Cas = (Get-Date).ToString('s'); Akce = $r.Akce; Zdroj = $r.Zdroj; Cil = $r.Cil }
             $done.Add($row)
             $row | Export-Csv -LiteralPath $LogPath -NoTypeInformation -Encoding UTF8 -Append
         } catch {
+            if ($moved) {
+                $errors.Add("PRESUNUTO, ALE ZAPIS LOGU SELHAL: $($r.Zdroj) -> $($r.Cil): $($_.Exception.Message)")
+                break # Dalsi soubory nesmi pokracovat bez spolehlive historie.
+            }
             $errors.Add("$(Split-Path $r.Zdroj -Leaf): $($_.Exception.Message)")
         }
         if ($OnProgress) { & $OnProgress $n $Rows.Count $r }
@@ -783,11 +788,10 @@ function Invoke-UndoBatch {
     foreach ($r in $rows) {
         $n++
         if (-not (Test-Path -LiteralPath $r.Cil)) {
-            # uz je zpet na puvodnim miste = v poradku; jinak o nem ztracime prehled
-            if (-not (Test-Path -LiteralPath $r.Zdroj)) {
-                $errors.Add("chybi: $($r.Cil)")
-                $zbyva.Add($r)
-            }
+            # Pritomnost souboru na puvodni ceste nedokazuje, ze jde o nasi kopii.
+            # Bez zaznamu hashe nelze automaticky uzavrit vraceni ani vzit starsi davku.
+            $errors.Add("cil chybi, puvodni cestu nelze overit: $($r.Cil)")
+            $zbyva.Add($r)
         } else {
             try { Move-FileSafe -Source $r.Cil -Target $r.Zdroj; $ok++ }
             catch { $errors.Add("$(Split-Path $r.Cil -Leaf): $($_.Exception.Message)"); $zbyva.Add($r) }

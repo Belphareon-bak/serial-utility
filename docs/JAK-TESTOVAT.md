@@ -6,7 +6,7 @@
 ```
 Musí skončit s `0 chyb`. Spusť ho ve Windows PowerShellu 5.1 nebo pwsh 7;
 vytváří jen dočasná testovací data (na Linuxu také v `/dev/shm`).
-Nové testy nebylo možné v tomto prostředí spustit, protože zde není PowerShell.
+Na tomto stroji prošlo 48/48 testů v PowerShellu 7.6.6 na Linuxu (2026-09-25). Otevřený blokující nález zápisu logu je v `REVIZE-3-2026-09-25.md`.
 
 ## 2. Vzorek dat
 **Vždy na kopii.** Zkopíruj pár desítek souborů do `D:\vzorek\Downloads` a knihovnu
@@ -27,8 +27,9 @@ Do vzorku dej:
    - česká a jiná verze dílu **nejsou** DUPLICITA.
 2. **Provést vybrané.** V `logs\` hned vznikne `mediatool-….csv`.
 3. **Přerušení:** spusť Provést na větší dávce na NAS a **zavři okno uprostřed**.
-   Log musí existovat a obsahovat soubory, které se stihly přesunout.
-   Pak **Vrátit poslední dávku** — musí je vrátit.
+   Porovnej přesunuté soubory s logem; při přerušení mezi přesunem a zápisem
+   může poslední řádek chybět. Automaticky vrať jen zaznamenané položky a ostatní
+   dohledávej ručně. Viz blokující nález v třetí revizi.
 4. **Neúplné vrácení:** po Provést dej na původní místo jednoho souboru jiný soubor
    se stejným jménem a dej Vrátit. Má ohlásit, že jeden soubor vrátit nešel, a dávka
    **nesmí** dostat příponu `.undone`. Po odstranění překážky dej Vrátit znovu —
