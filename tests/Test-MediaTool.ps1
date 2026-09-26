@@ -87,7 +87,74 @@ finally { Remove-Item Function:\Export-Csv }
 Assert-Eq $true (Test-Path "$d/dst/f1.mkv") 'prvni presun probehl'
 Assert-Eq $true (Test-Path "$d/src/f2.mkv") 'druhy presun se po chybe logu neprovede'
 Assert-Eq 1 $res.Errors.Count 'chyba zapisu se ohlasi'
-Assert-Eq $true ($res.Errors[0] -like '*ZAPIS LOGU SELHAL*') 'chyba upozorni na presun bez spolehliveho logu'
+Assert-Eq $true (Test-Path "$log.intent.json") 'zamer presunu zustane ulozeny pred zmenou souboru'
+Assert-Eq $true ($res.Errors[0] -like '*intent.json*') 'chyba ukaze na obnovitelny zaznam'
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq 1 @(Import-Csv $log).Count 'po obnove je presun v logu'
+Assert-Eq $false (Test-Path "$log.intent.json") 'zamer se odstrani az po obnove logu'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Obnova pred a po fyzickem presunu"
+$d = New-TestDir
+New-File "$d/src/a.mkv" 300000 71
+$source = "$d/src/a.mkv"; $target = "$d/dst/a.mkv"
+$log = "$d/logs/mediatool-recovery.csv"
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+$hash = (Get-FileHash $source -Algorithm SHA256).Hash
+$row = [pscustomobject]@{ Cas = 'test'; Akce = 'PRESUN'; Zdroj = $source; Cil = $target; Hash = $hash }
+$record = [pscustomobject]@{ Version = 1; Source = $source; Target = $target; Hash = $hash; Row = $row }
+Write-PendingRecord "$log.intent.json" $record
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq $true (Test-Path $source) 'pred presunem zdroj zustane'
+Assert-Eq $false (Test-Path $log) 'pred presunem nevznikne falesny log'
+Write-PendingRecord "$log.intent.json" $record
+Move-FileSafe $source $target
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq 1 @(Import-Csv $log).Count 'dokonceny presun se po padu dohleda'
+Assert-Eq $hash @(Import-Csv $log)[0].Hash 'obnoveny log zachova otisk'
+Assert-Eq $false (Test-Path "$log.intent.json") 'po obnove nezustane zamer otevreny'
+$res = Invoke-UndoBatch -Log (Get-Item $log)
+Assert-Eq 0 $res.Remaining 'obnoveny presun jde vratit'
+Assert-Eq $true (Test-Path $source) 'zdroj je po vraceni zpet'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Nejednoznacny zamer se nesmi domyslet"
+$d = New-TestDir
+New-File "$d/src/a.mkv" 300000 72
+$source = "$d/src/a.mkv"; $target = "$d/dst/a.mkv"
+New-Item -ItemType Directory (Split-Path $target -Parent) | Out-Null
+Copy-Item $source $target
+$log = "$d/logs/mediatool-ambiguous.csv"
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+$hash = (Get-FileHash $source -Algorithm SHA256).Hash
+Write-PendingRecord "$log.intent.json" ([pscustomobject]@{
+    Version = 1; Source = $source; Target = $target; Hash = $hash
+    Row = [pscustomobject]@{ Cas = 'test'; Akce = 'PRESUN'; Zdroj = $source; Cil = $target; Hash = $hash }
+})
+$chyba = $null; try { Resolve-PendingJournals (Split-Path $log -Parent) } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*Nejednoznacny*' -or $chyba -like '*Nejednoznačný*') 'nejednoznacny stav se zablokuje'
+Assert-Eq $true (Test-Path $source) 'nejednoznacny zdroj zustane'
+Assert-Eq $true (Test-Path $target) 'nejednoznacny cil zustane'
+Assert-Eq $true (Test-Path "$log.intent.json") 'zamer zustane pro kontrolu'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Chyba logu po vraceni se sama napravi"
+$d = New-TestDir
+New-File "$d/src/a.mkv" 300000 73
+$source = "$d/src/a.mkv"; $target = "$d/dst/a.mkv"
+$log = "$d/logs/mediatool-undo-failure.csv"
+Invoke-MoveBatch -Rows @([pscustomobject]@{ Akce = 'PRESUN'; Zdroj = $source; Cil = $target }) -LogPath $log | Out-Null
+$originalSaveBatchRows = (Get-Command Save-BatchRows).ScriptBlock
+function Save-BatchRows { throw 'simulovana chyba zapisu po vraceni' }
+try { $res = Invoke-UndoBatch -Log (Get-Item $log) }
+finally { Set-Item Function:\Save-BatchRows $originalSaveBatchRows }
+Assert-Eq 1 $res.Remaining 'pred obnovou zustava radek v logu'
+Assert-Eq $true (Test-Path "$log.undo.json") 'zamer vraceni je uchovan'
+Assert-Eq $true (Test-Path $source) 'fyzicke vraceni probehlo'
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq 0 @(Import-Csv $log).Count 'obnova odstranila vraceny radek'
+$res = Invoke-UndoBatch -Log (Get-Item $log)
+Assert-Eq $true (Test-Path "$log.undone") 'davka se uzavrela az po obnoveni logu'
 Remove-Item -Recurse -Force $d
 
 Write-Host "`n== Castecne vraceni neoznaci davku za hotovou"
@@ -139,6 +206,19 @@ $chyba = $null; try { Move-FileSafe -Source "$d/b.mkv" -Target "$d/cil/b.mkv" } 
 Assert-Eq $true ($chyba -like '*SHA-256*') 'poskozena kopie se stejnou delkou je odhalena'
 Assert-Eq $puvodni (Get-FileHash "$d/b.mkv").Hash 'zdroj zustal nedotceny'
 Assert-Eq $false (Test-Path "$d/cil/b.mkv") 'poskozena kopie v cili nezustala'
+Remove-Item Function:\Copy-Item
+New-File "$d/c.mkv" 300000 81
+function Rename-Item { param($LiteralPath, $NewName)
+    Microsoft.PowerShell.Management\Rename-Item -LiteralPath $LiteralPath -NewName $NewName
+    $published = Join-Path (Split-Path $LiteralPath -Parent) $NewName
+    $fs = [IO.File]::Open($published, 'Open', 'ReadWrite'); $fs.Position = 150000
+    $before = $fs.ReadByte(); $fs.Position = 150000
+    $fs.WriteByte(($before -bxor 0xFF)); $fs.Close()
+}
+$chyba = $null; try { Move-FileSafe -Source "$d/c.mkv" -Target "$d/cil/c.mkv" } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*zverejneny cil*') 'poskozeni po zverejneni cile se odhali'
+Assert-Eq $true (Test-Path "$d/c.mkv") 'zdroj zustane i po poskozeni zverejneneho cile'
+Remove-Item Function:\Rename-Item
 New-File "$d/stale.mkv" 300000 9
 New-File "$d/cil/stale.mkv.mtpart" 20 10
 $staleHash = (Get-FileHash "$d/cil/stale.mkv.mtpart" -Algorithm SHA256).Hash
@@ -146,7 +226,6 @@ $chyba = $null; try { Move-FileSafe -Source "$d/stale.mkv" -Target "$d/cil/stale
 Assert-Eq $true ($chyba -like '*docasna kopie uz existuje*') 'stara .mtpart zastavi presun'
 Assert-Eq $staleHash (Get-FileHash "$d/cil/stale.mkv.mtpart" -Algorithm SHA256).Hash 'stara .mtpart zustane nedotcena'
 Assert-Eq $true (Test-Path "$d/stale.mkv") 'zdroj zustane pri kolizi .mtpart'
-Remove-Item Function:\Copy-Item
 Set-Item Function:\Test-SameVolume $originalSameVolume
 Remove-Item -Recurse -Force $d
 
@@ -197,12 +276,140 @@ Write-Host "`n== Kontrola pred smazanim duplicity"
 $d = New-TestDir
 New-File "$d/keep.mkv" 3MB 11; Copy-Item "$d/keep.mkv" "$d/dup.mkv"
 Assert-Eq '' "$(Test-DuplicateDeletable "$d/dup.mkv" "$d/keep.mkv" 'shodna data')" 'shodna kopie smazat lze'
+Assert-Eq $true ((Test-DuplicateDeletable "$d/dup.mkv" "$d/keep.mkv" 'stejny dil, jina data') -like '*jen bajtove shodnou*') 'ruznou verzi dilu nelze automaticky smazat'
 $fs = [IO.File]::Open("$d/dup.mkv", 'Open', 'ReadWrite'); $fs.Position = 1500000; $fs.WriteByte(0x00); $fs.Close()
 Assert-Eq (Get-QuickHash (Get-Item "$d/keep.mkv")) (Get-QuickHash (Get-Item "$d/dup.mkv")) 'rychly otisk rozdil uprostred neodhali'
 Assert-Eq $true ((Test-DuplicateDeletable "$d/dup.mkv" "$d/keep.mkv" 'shodna data') -like '*jiny obsah*') 'uplne porovnani ho odhali a smazani zastavi'
 Remove-Item "$d/keep.mkv"
-Assert-Eq $true ((Test-DuplicateDeletable "$d/dup.mkv" "$d/keep.mkv" 'stejny dil, jina data') -like '*chybi*') 'chybejici ponechana kopie zastavi smazani'
+Assert-Eq $true ((Test-DuplicateDeletable "$d/dup.mkv" "$d/keep.mkv" 'shodna data') -like '*chybi*') 'chybejici ponechana kopie zastavi smazani'
 Assert-Eq $true ((Test-DuplicateDeletable "$d/dup.mkv" '' 'shodna data') -like '*neni znama*') 'bez udaje o ponechane kopii se nemaze'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Upraveny nazev nesmi opustit cilovou slozku"
+$d = New-TestDir
+$inside = Resolve-EditedTarget $d 'Serialy/Film.mkv'
+Assert-Eq (Join-Path $d 'Serialy/Film.mkv') $inside 'bezpecna relativni cesta je povolena'
+$chyba = $null; try { Resolve-EditedTarget $d '../mimo.mkv' | Out-Null } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*relativni cesta*' -or $chyba -like '*relativní cesta*') 'dve tecky jsou odmitnuty'
+$chyba = $null; try { Resolve-EditedTarget $d (Join-Path ([IO.Path]::GetTempPath()) 'mimo.mkv') | Out-Null } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*relativni cesta*' -or $chyba -like '*relativní cesta*') 'absolutni cesta je odmitnuta'
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    New-Item -ItemType Directory (Join-Path $d 'inner') | Out-Null
+    New-Item -ItemType SymbolicLink -Path (Join-Path $d 'link') -Target (Join-Path $d 'inner') | Out-Null
+    $chyba = $null; try { Resolve-EditedTarget $d 'link/Film.mkv' | Out-Null } catch { $chyba = $_.Exception.Message }
+    Assert-Eq $true ($chyba -like '*odkazem*') 'odkaz v relativni ceste je odmitnut'
+}
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Mnoho kolizi nazvu nevrati obsazeny cil"
+$d = New-TestDir
+1..101 | ForEach-Object {
+    $name = if ($_ -eq 1) { 'Film.mkv' } else { "Film ($_)" + '.mkv' }
+    New-File (Join-Path $d $name) 10 $_
+}
+$taken = New-Object System.Collections.Generic.HashSet[string]
+$unique = Get-UniqueTarget (Join-Path $d 'Film.mkv') $taken
+Assert-Eq 'Film (102).mkv' (Split-Path $unique -Leaf) 'po 101 kolizich vznikne volny nazev'
+Assert-Eq $false (Test-Path $unique) 'novy cil dosud neexistuje'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Soubezny beh a zmeneny cil se zablokuji"
+$d = New-TestDir
+New-File "$d/src/a.mkv" 300000 74
+$log = "$d/logs/mediatool-lock.csv"
+$row = [pscustomobject]@{ Akce = 'PRESUN'; Zdroj = "$d/src/a.mkv"; Cil = "$d/dst/a.mkv" }
+$operationLock = Enter-MediaToolLock (Split-Path $log -Parent)
+$chyba = $null
+try { Invoke-MoveBatch -Rows @($row) -LogPath $log | Out-Null } catch { $chyba = $_.Exception.Message }
+finally { $operationLock.Dispose() }
+Assert-Eq $true ([bool]$chyba) 'druhy proces nedostane soubezny pristup'
+Assert-Eq $true (Test-Path "$d/src/a.mkv") 'pri blokaci soubehu zdroj zustane'
+Assert-Eq $false (Test-Path "$d/dst/a.mkv") 'pri blokaci soubehu cil nevznikne'
+Invoke-MoveBatch -Rows @($row) -LogPath $log | Out-Null
+[IO.File]::WriteAllBytes("$d/dst/a.mkv", [byte[]](5,6,7))
+$res = Invoke-UndoBatch -Log (Get-Item $log)
+Assert-Eq 1 $res.Remaining 'zmeneny cil nejde vratit jako puvodni soubor'
+Assert-Eq $false (Test-Path "$d/src/a.mkv") 'pri zmenenem cili zdroj nevznikne'
+Assert-Eq $true (Test-Path $log) 'log zustane otevreny'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Historicky log bez hashe se nevraci naslepo"
+$d = New-TestDir
+New-File "$d/dst/a.mkv" 300000 75
+$log = "$d/logs/mediatool-old.csv"
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+[pscustomobject]@{ Cas = 'historicky'; Akce = 'PRESUN'; Zdroj = "$d/src/a.mkv"; Cil = "$d/dst/a.mkv" } |
+    Export-Csv -LiteralPath $log -NoTypeInformation -Encoding UTF8
+$res = Invoke-UndoBatch -Log (Get-Item $log)
+Assert-Eq 1 $res.Remaining 'bez puvodniho otisku se automaticke vraceni zablokuje'
+Assert-Eq $true (Test-Path "$d/dst/a.mkv") 'historicky cil zustane nedotceny'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Zamer lokalniho mazani se obnovi po preruseni"
+$d = New-TestDir
+New-File "$d/keep.mkv" 300000 76
+Copy-Item "$d/keep.mkv" "$d/duplicate.mkv"
+$log = "$d/logs/smazano-test.csv"
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+$hash = (Get-FileHash "$d/duplicate.mkv" -Algorithm SHA256).Hash
+$record = [pscustomobject]@{
+    Version = 1; Source = "$d/duplicate.mkv"; Target = "$d/keep.mkv"; Hash = $hash
+    Row = [pscustomobject]@{ Cas = 'test'; Zdroj = "$d/duplicate.mkv"; MB = 1; Zpusob = 'kos'; Hash = $hash; Ponechat = "$d/keep.mkv" }
+}
+Write-PendingRecord "$log.delete.json" $record
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq $true (Test-Path "$d/duplicate.mkv") 'pred smazanim kopie zustane'
+Assert-Eq $false (Test-Path $log) 'pred smazanim nevznikne falesny zaznam'
+Write-PendingRecord "$log.delete.json" $record
+Remove-Item "$d/duplicate.mkv"
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq 1 @(Import-Csv $log).Count 'po smazani se zaznam obnovi'
+Assert-Eq $hash @(Import-Csv $log)[0].Hash 'audit smazani nese otisk'
+Assert-Eq $true (Test-Path "$d/keep.mkv") 'ponechana kopie existuje'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Rozporny historicky radek nesmi prekryt novy zamer"
+$d = New-TestDir
+New-File "$d/src/a.mkv" 300000 77
+$log = "$d/logs/mediatool-conflict.csv"
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+$hash = (Get-FileHash "$d/src/a.mkv" -Algorithm SHA256).Hash
+[pscustomobject]@{ Cas = 'historicky'; Akce = 'PRESUN'; Zdroj = "$d/src/a.mkv"; Cil = "$d/dst/a.mkv"; Hash = ('0' * 64) } |
+    Export-Csv -LiteralPath $log -NoTypeInformation -Encoding UTF8
+Write-PendingRecord "$log.intent.json" ([pscustomobject]@{
+    Version = 1; Source = "$d/src/a.mkv"; Target = "$d/dst/a.mkv"; Hash = $hash
+    Row = [pscustomobject]@{ Cas = 'test'; Akce = 'PRESUN'; Zdroj = "$d/src/a.mkv"; Cil = "$d/dst/a.mkv"; Hash = $hash }
+})
+$chyba = $null; try { Resolve-PendingJournals (Split-Path $log -Parent) } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*jiny SHA-256*') 'rozporny log se zastavi'
+Assert-Eq $true (Test-Path "$log.intent.json") 'zamer zustane pro kontrolu'
+Assert-Eq $true (Test-Path "$d/src/a.mkv") 'zdroj zustane beze zmeny'
+Remove-Item -Recurse -Force $d
+
+Write-Host "`n== Prerusena vlastni docasna kopie se uklidi podle zameru"
+$d = New-TestDir
+$source = "$d/src/a.mkv"; $target = "$d/dst/a.mkv"; $log = "$d/logs/mediatool-partial.csv"
+New-File $source 300000 78
+New-Item -ItemType Directory (Split-Path $log -Parent) | Out-Null
+$hash = (Get-FileHash $source -Algorithm SHA256).Hash
+$temp = "$target.$([guid]::NewGuid().ToString('N')).mtpart"
+$record = [pscustomobject]@{
+    Version = 1; Source = $source; Target = $target; Hash = $hash; TempPath = $temp
+    Row = [pscustomobject]@{ Cas = 'test'; Akce = 'PRESUN'; Zdroj = $source; Cil = $target; Hash = $hash }
+}
+Write-PendingRecord "$log.intent.json" $record
+New-File $temp 1000 79
+Resolve-PendingJournals (Split-Path $log -Parent)
+Assert-Eq $false (Test-Path $temp) 'vlastni rozpracovana kopie zmizi'
+Assert-Eq $true (Test-Path $source) 'overeny zdroj zustane'
+Assert-Eq $false (Test-Path "$log.intent.json") 'neprovedeny zamer se uzavre'
+Assert-Eq $false (Test-Path $log) 'nevznikne falesny log presunu'
+$foreign = "$d/foreign.mkv"; New-File $foreign 1000 80
+$record.TempPath = $foreign
+Write-PendingRecord "$log.intent.json" $record
+$chyba = $null; try { Resolve-PendingJournals (Split-Path $log -Parent) } catch { $chyba = $_.Exception.Message }
+Assert-Eq $true ($chyba -like '*neplatnou cestu*') 'cizi docasna cesta se odmitne'
+Assert-Eq $true (Test-Path $foreign) 'cizi soubor zustane nedotceny'
 Remove-Item -Recurse -Force $d
 
 Write-Host ""

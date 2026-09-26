@@ -7,12 +7,12 @@
     Sjednoti nazvy serialu a filmu na jednotnou konvenci, najde duplicity
     (i ty, ktere se jmenuji uplne jinak) a setridi soubory do knihovny.
 
-    Nic nemaze. Duplicity presouva do slozky _Duplicity.
+    CLI nema prikaz pro prime mazani. Duplicity pri trideni presouva do _Duplicity.
     Bez prepinace -Apply pouze ukazuje, co by udelal.
 
     Umi Synology pres SMB (namapovany disk i UNC cesta):
       - preskakuje @eaDir, #recycle, #snapshot
-      - presun mezi svazky dela jako kopie + overeni velikosti + smazani zdroje
+      - presun mezi svazky dela jako kopie + overeni velikosti a SHA-256 + smazani zdroje
       - hlida delku cilove cesty a znaky, ktere SMB/DSM nema rad
 
 .PARAMETER Command
@@ -498,7 +498,7 @@ function Test-CaseOnlyRename {
 
 function Move-FileSafe {
     # presun odolny vuci NAS: mezi svazky kopie + overeni + smazani zdroje
-    param([string]$Source, [string]$Target)
+    param([string]$Source, [string]$Target, [string]$TempPath)
 
     $dir = Split-Path $Target -Parent
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -522,7 +522,7 @@ function Move-FileSafe {
     }
 
     # jiny svazek (lokalni disk -> Synology): kopie, overit, teprve pak smazat
-    $tmp = "$Target.mtpart"
+    $tmp = if ($TempPath) { $TempPath } else { "$Target.mtpart" }
     if (Test-Path -LiteralPath $tmp) { throw "docasna kopie uz existuje: $tmp; zdroj ponechan" }
     Copy-Item -LiteralPath $Source -Destination $tmp
     $a = (Get-Item -LiteralPath $Source).Length
@@ -540,6 +540,9 @@ function Move-FileSafe {
         throw "kopie nesouhlasi obsahem (SHA-256), zdroj ponechan"
     }
     Rename-Item -LiteralPath $tmp -NewName (Split-Path $Target -Leaf)
+    if ((Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash -ne $ha) {
+        throw "zverejneny cil se zmenil, zdroj ponechan: $Target"
+    }
     Remove-Item -LiteralPath $Source -Force
 }
 
@@ -555,10 +558,42 @@ function Get-UniqueTarget {
             -not (Test-CaseOnlyRename $Source $try))) {
         $try = Join-Path $dir ("$name ($i)$ext")
         $i++
-        if ($i -gt 99) { break }
+        if ($i -gt 100000) { throw "Nelze najít volný cílový název: $Target" }
     }
     [void]$Taken.Add($try.ToLowerInvariant())
     return $try
+}
+
+function Resolve-EditedTarget {
+    param([string]$Root, [string]$Child)
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Child) -or
+        [IO.Path]::IsPathRooted($Child) -or $Child -match '(^|[\\/])\.\.?([\\/]|$)') {
+        throw "Nový název musí být relativní cesta bez . a ..: $Child"
+    }
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $rootBase = $rootFull.TrimEnd([char[]]@('/', '\'))
+    if ($rootBase.Length -eq 0) { $rootBase = [string][IO.Path]::DirectorySeparatorChar }
+    if ($rootBase -match '^[A-Za-z]:$') { $rootBase += [IO.Path]::DirectorySeparatorChar }
+    $prefix = $rootBase
+    if (-not $prefix.EndsWith([string][IO.Path]::DirectorySeparatorChar)) {
+        $prefix += [IO.Path]::DirectorySeparatorChar
+    }
+    $targetFull = [IO.Path]::GetFullPath((Join-Path $rootBase $Child))
+    $comparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [StringComparison]::OrdinalIgnoreCase
+    } else { [StringComparison]::Ordinal }
+    if (-not $targetFull.StartsWith($prefix, $comparison)) {
+        throw "Nový název opouští cílovou složku: $Child"
+    }
+    $current = $rootBase
+    foreach ($segment in ($targetFull.Substring($prefix.Length) -split '[\\/]')) {
+        $current = Join-Path $current $segment
+        if ((Test-Path -LiteralPath $current) -and
+            ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Cílová cesta prochází odkazem nebo junction: $current"
+        }
+    }
+    return $targetFull
 }
 
 # ---------------------------------------------------------------------- sber
@@ -744,68 +779,11 @@ function Show-Plan {
     }
 }
 
-function Invoke-MoveBatch {
-    # Provede presuny Zdroj -> Cil. Log se zapisuje po kazdem presunu, ale
-    # pri selhani zapisu nebo padu mezi presunem a logem muze zaznam chybet.
-    # Pouziva ji prikazova radka i GUI, aby existovala jedina implementace.
-    param([object[]]$Rows, [string]$LogPath, [scriptblock]$OnProgress)
-    $done   = New-Object System.Collections.Generic.List[object]
-    $errors = New-Object System.Collections.Generic.List[string]
-    $logDir = Split-Path $LogPath -Parent
-    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-    $n = 0
-    foreach ($r in $Rows) {
-        $n++
-        $moved = $false
-        try {
-            Move-FileSafe -Source $r.Zdroj -Target $r.Cil
-            $moved = $true
-            $row = [pscustomobject]@{ Cas = (Get-Date).ToString('s'); Akce = $r.Akce; Zdroj = $r.Zdroj; Cil = $r.Cil }
-            $done.Add($row)
-            $row | Export-Csv -LiteralPath $LogPath -NoTypeInformation -Encoding UTF8 -Append
-        } catch {
-            if ($moved) {
-                $errors.Add("PRESUNUTO, ALE ZAPIS LOGU SELHAL: $($r.Zdroj) -> $($r.Cil): $($_.Exception.Message)")
-                break # Dalsi soubory nesmi pokracovat bez spolehlive historie.
-            }
-            $errors.Add("$(Split-Path $r.Zdroj -Leaf): $($_.Exception.Message)")
-        }
-        if ($OnProgress) { & $OnProgress $n $Rows.Count $r }
-    }
-    return [pscustomobject]@{ Done = $done; Errors = $errors }
+$JournalPath = Join-Path $PSScriptRoot 'media-tool-journal.ps1'
+if (-not (Test-Path -LiteralPath $JournalPath -PathType Leaf)) {
+    throw "Chybí bezpečnostní část MediaToolu: $JournalPath"
 }
-
-function Invoke-UndoBatch {
-    # Vrati davku z logu. Za vracenou (.undone) se oznaci JEN kdyz se vratilo vse.
-    # Jinak v logu zustanou soubory, ktere se vratit nepodarilo, a dalsi vraceni
-    # zkusi znovu presne je - ne starsi davku, jak se to delo driv.
-    param([System.IO.FileInfo]$Log, [scriptblock]$OnProgress)
-    $rows = @(Import-Csv -LiteralPath $Log.FullName)
-    [array]::Reverse($rows)
-    $zbyva  = New-Object System.Collections.Generic.List[object]
-    $errors = New-Object System.Collections.Generic.List[string]
-    $ok = 0; $n = 0
-    foreach ($r in $rows) {
-        $n++
-        if (-not (Test-Path -LiteralPath $r.Cil)) {
-            # Pritomnost souboru na puvodni ceste nedokazuje, ze jde o nasi kopii.
-            # Bez zaznamu hashe nelze automaticky uzavrit vraceni ani vzit starsi davku.
-            $errors.Add("cil chybi, puvodni cestu nelze overit: $($r.Cil)")
-            $zbyva.Add($r)
-        } else {
-            try { Move-FileSafe -Source $r.Cil -Target $r.Zdroj; $ok++ }
-            catch { $errors.Add("$(Split-Path $r.Cil -Leaf): $($_.Exception.Message)"); $zbyva.Add($r) }
-        }
-        if ($OnProgress) { & $OnProgress $n $rows.Count $r }
-    }
-    if ($zbyva.Count -eq 0) {
-        Rename-Item -LiteralPath $Log.FullName -NewName ($Log.Name + '.undone')
-    } else {
-        $zbyva.Reverse()
-        $zbyva | Export-Csv -LiteralPath $Log.FullName -NoTypeInformation -Encoding UTF8
-    }
-    return [pscustomobject]@{ Restored = $ok; Errors = $errors; Remaining = $zbyva.Count }
-}
+. $JournalPath
 
 function Test-DuplicateDeletable {
     # Vraci $null, kdyz lze duplicitu smazat; jinak duvod, proc ne.
@@ -814,6 +792,7 @@ function Test-DuplicateDeletable {
     # rezimu pocita jen z prvniho a posledniho MB, a to na trvale smazani nestaci.
     param([string]$Zdroj, [string]$Ponechat, [string]$Typ)
     if ([string]::IsNullOrWhiteSpace($Ponechat)) { return 'neni znama ponechana kopie' }
+    if ($Typ -ne 'shodna data') { return 'mazat lze jen bajtove shodnou kopii; jinou verzi presun do _Duplicity' }
     if ($Ponechat -eq $Zdroj) { return 'ponechana kopie je tentyz soubor' }
     if (-not (Test-Path -LiteralPath $Zdroj)) { return 'duplicita uz neexistuje' }
     if (-not (Test-Path -LiteralPath $Ponechat)) { return "ponechana kopie chybi: $Ponechat" }
@@ -837,7 +816,7 @@ function Invoke-Plan {
         return
     }
 
-    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}-{1}.csv' -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 8))
     $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
         param($n, $total, $r)
         Write-Progress -Activity 'MediaTool' -Status "$n / $total`: $(Split-Path $r.Zdroj -Leaf)" -PercentComplete (100 * $n / $total)
@@ -845,7 +824,9 @@ function Invoke-Plan {
     Write-Progress -Activity 'MediaTool' -Completed
     foreach ($e in $res.Errors) { Write-Warning $e }
 
-    if ($res.Done.Count -gt 0) {
+    if ($res.Errors.Count -gt 0) {
+        Write-Host "`nDávka skončila s chybami. Zkontroluj uvedené cesty a rozpracované záznamy v $LogDir." -ForegroundColor Yellow
+    } elseif ($res.Done.Count -gt 0) {
         Write-Host "`nHotovo: $($res.Done.Count) souboru. Log: $log" -ForegroundColor Green
         Write-Host 'Vratit zpet:  .\media-tool.ps1 undo -Apply' -ForegroundColor DarkGray
     }
@@ -853,6 +834,7 @@ function Invoke-Plan {
 
 function Invoke-Undo {
     if (-not (Test-Path -LiteralPath $LogDir)) { Write-Host 'Zadny log k vraceni.'; return }
+    Resolve-PendingJournals $LogDir
     $log = Get-ChildItem -LiteralPath $LogDir -Filter 'mediatool-*.csv' | Sort-Object Name -Descending | Select-Object -First 1
     if (-not $log) { Write-Host 'Zadny log k vraceni.'; return }
 

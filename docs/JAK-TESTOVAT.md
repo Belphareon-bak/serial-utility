@@ -6,7 +6,7 @@
 ```
 Musí skončit s `0 chyb`. Spusť ho ve Windows PowerShellu 5.1 nebo pwsh 7;
 vytváří jen dočasná testovací data (na Linuxu také v `/dev/shm`).
-Na tomto stroji prošlo 48/48 testů v PowerShellu 7.6.6 na Linuxu (2026-09-25). Otevřený blokující nález zápisu logu je v `REVIZE-3-2026-09-25.md`.
+Aktuální sada prošla 98/98 testů v PowerShellu 7.6.6 na Linuxu (2026-09-26). Novou obnovu po přerušení popisuje `REVIZE-4-2026-09-26.md`.
 
 ## 2. Vzorek dat
 **Vždy na kopii.** Zkopíruj pár desítek souborů do `D:\vzorek\Downloads` a knihovnu
@@ -27,14 +27,14 @@ Do vzorku dej:
    - česká a jiná verze dílu **nejsou** DUPLICITA.
 2. **Provést vybrané.** V `logs\` hned vznikne `mediatool-….csv`.
 3. **Přerušení:** spusť Provést na větší dávce na NAS a **zavři okno uprostřed**.
-   Porovnej přesunuté soubory s logem; při přerušení mezi přesunem a zápisem
-   může poslední řádek chybět. Automaticky vrať jen zaznamenané položky a ostatní
-   dohledávej ručně. Viz blokující nález v třetí revizi.
+   Po novém spuštění použij Vrátit poslední dávku; aplikace nejprve obnoví
+   rozpracovaný záměr podle SHA-256. Pokud jsou obě cesty obsazené nebo otisk
+   nesouhlasí, má se zastavit bez mazání a vyžadovat ruční kontrolu.
 4. **Neúplné vrácení:** po Provést dej na původní místo jednoho souboru jiný soubor
    se stejným jménem a dej Vrátit. Má ohlásit, že jeden soubor vrátit nešel, a dávka
    **nesmí** dostat příponu `.undone`. Po odstranění překážky dej Vrátit znovu —
    vrátí se ten jeden soubor, ne starší dávka.
-5. **Smazat duplicity:** v náhledu vyber duplicitu, pak **ponechanou kopii ručně
+5. **Smazat duplicity:** jen na místním pevném disku a jen u bajtově shodné kopie. V náhledu vyber duplicitu, pak **ponechanou kopii ručně
    přesuň jinam** a dej Smazat duplicity. Musí odmítnout s hláškou
    „NESMAZANO – ponechana kopie chybi".
 
@@ -46,3 +46,7 @@ Do vzorku dej:
 | mazání do Koše | `Microsoft.VisualBasic.FileIO` je jen na Windows |
 | přejmenování `Film (2015).MKV` → `Film (2015).mkv` na místě | nový regresní test běží jen na Windows; výsledek je nutné potvrdit na NTFS |
 | přesun přes junction na jiný disk | na testovacích složkách dvou disků ověř, že `Test-SameVolume` vrátí `False`; pak zkus malý soubor a porovnej SHA-256 |
+
+
+Staré `mediatool-*.csv` bez sloupce `Hash` se automaticky nevracejí. Původní
+cíl a zdroj nejprve ručně ověř; nové dávky už otisk obsahují.

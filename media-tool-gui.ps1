@@ -374,13 +374,24 @@ function Set-Busy {
 
 function Test-NetworkPath {
     param([string]$P)
-    if ([string]::IsNullOrWhiteSpace($P)) { return $false }
+    # Mazání je povoleno jen na prokazatelně místním pevném disku.
+    if ([string]::IsNullOrWhiteSpace($P)) { return $true }
     if ($P.StartsWith('\\')) { return $true }
     try {
         $root = [System.IO.Path]::GetPathRoot($P)
+        if ([string]::IsNullOrWhiteSpace($root)) { return $true }
         $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($root.TrimEnd('\'))'" -ErrorAction SilentlyContinue
-        return ($d -and $d.DriveType -eq 4)
-    } catch { return $false }
+        if (-not $d -or $d.DriveType -ne 3) { return $true }
+        $current = [IO.Path]::GetFullPath($P)
+        while ($current) {
+            $entry = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $true }
+            $parent = Split-Path $current -Parent
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) { break }
+            $current = $parent
+        }
+        return $false
+    } catch { return $true }
 }
 
 function Confirm-Folder {
@@ -583,7 +594,7 @@ function Get-CheckedRows {
         $dir  = [string]$r.Cells['col_dir'].Value
         $name = [string]$r.Cells['col_new'].Value
         $cil  = ''
-        if ($dir -and $name) { $cil = Join-Path $dir $name }
+        if ($dir -and $name -and $JenAkce -ne 'DUPLICITA') { $cil = Resolve-EditedTarget $dir $name }
         $vysledek.Add([pscustomobject]@{
             Akce = $akce; Zdroj = [string]$r.Cells['col_src'].Value
             Cil  = $cil;  MB    = [double]$r.Cells['col_mb'].Value })
@@ -596,7 +607,12 @@ function Invoke-Apply {
         [System.Windows.Forms.MessageBox]::Show('Nejdřív si nech ukázat náhled.', 'MediaTool', 'OK', 'Information') | Out-Null
         return
     }
-    $todo = @((Get-CheckedRows) | Where-Object { $_.Cil })
+    try { $todo = @((Get-CheckedRows) | Where-Object { $_.Cil }) }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Cílový název není bezpečný: $($_.Exception.Message)", 'MediaTool', 'OK', 'Warning') | Out-Null
+        return
+    }
     if ($todo.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show(
             "Není zaškrtnutý žádný řádek, který by se dal přesunout.`n" +
@@ -606,27 +622,35 @@ function Invoke-Apply {
     }
 
     $odp = [System.Windows.Forms.MessageBox]::Show(
-        "Provést $($todo.Count) operací?`n`nDokončené přesuny lze běžně vrátit z logu. " +
-        'Při chybě zápisu logu zkontroluj soubory ručně.', 'MediaTool', 'YesNo', 'Question')
+        "Provést $($todo.Count) operací?`n`nZáměr se uloží před každým přesunem. " +
+        'Po přerušení aplikace ověří skutečné soubory a obnoví log.', 'MediaTool', 'YesNo', 'Question')
     if ($odp -ne 'Yes') { return }
 
     Set-Busy $true 'Pracuji...'
     $pb.Value = 0; $pb.Maximum = $todo.Count; $pb.Visible = $true
 
-    # Invoke-MoveBatch zapisuje log po kazdem presunu, ale mezi presunem a zapisem
-    # zustava mezera. Pri selhani logu je potreba zkontrolovat soubory rucne.
-    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
-    $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
-        param($n, $total, $r)
-        $pb.Value = $n
-        $lblStatus.Text = "$n / $total - $(Split-Path $r.Zdroj -Leaf)"
-        [System.Windows.Forms.Application]::DoEvents()
+    # Trvaly zamer je zapsan pred kazdym presunem; po selhani lze log obnovit.
+    $log = Join-Path $LogDir ('mediatool-{0:yyyyMMdd-HHmmss}-{1}.csv' -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        $res = Invoke-MoveBatch -Rows $todo -LogPath $log -OnProgress {
+            param($n, $total, $r)
+            $pb.Value = $n
+            $lblStatus.Text = "$n / $total - $(Split-Path $r.Zdroj -Leaf)"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch {
+        $pb.Visible = $false
+        Set-Busy $false 'Přesun byl zastaven.'
+        [System.Windows.Forms.MessageBox]::Show(
+            "Přesun se nepodařil bezpečně dokončit: $($_.Exception.Message)",
+            'MediaTool', 'OK', 'Error') | Out-Null
+        return
     }
     $done  = $res.Done
     $chyby = $res.Errors
 
     $pb.Visible = $false
-    Set-Busy $false "Hotovo: $($done.Count) souborů, chyb: $($chyby.Count)."
+    Set-Busy $false "Přesunuto: $($done.Count) souborů, chyb: $($chyby.Count)."
     if ($chyby.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show(
             "Část souborů se nepodařila:`n`n" + (($chyby | Select-Object -First 15) -join "`n"),
@@ -646,7 +670,20 @@ function Invoke-DeleteDuplicates {
 
     $celkem = ($todo | Measure-Object -Property MB -Sum).Sum
     $trvale = [bool]$chkTrvale.Checked
-    $vSiti  = @($todo | Where-Object { Test-NetworkPath $_.Zdroj }).Count
+    $vSiti = 0
+    foreach ($t in $todo) {
+        $kept = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
+                Select-Object -First 1
+        if ((Test-NetworkPath $t.Zdroj) -or (Test-NetworkPath $kept.Ponechat)) { $vSiti++ }
+    }
+    if ($vSiti -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Mazání je zablokované, pokud je mazaný nebo ponechaný soubor na síťovém, ' +
+            'odkazovaném nebo neověřeném svazku. Koš tam nemusí fungovat. ' +
+            'Použij režim Setřídit do knihovny, který duplicity přesune do _Duplicity.',
+            'MediaTool', 'OK', 'Warning') | Out-Null
+        return
+    }
 
     if ($trvale) { $jak = 'TRVALE (bez Koše) - tohle už nepůjde vrátit' }
     else         { $jak = 'do Koše (dají se odtud obnovit)' }
@@ -654,11 +691,6 @@ function Invoke-DeleteDuplicates {
     $zprava = "Smazat $($todo.Count) duplicitních souborů $jak" + "?`n`n" +
               ('Uvolní se {0:N2} GB.' -f ($celkem / 1024)) + "`n`n" +
               'Ponechané soubory se nemažou - jde jen o zaškrtnuté řádky DUPLICITA.'
-    if ($vSiti -gt 0 -and -not $trvale) {
-        $zprava += "`n`nPOZOR: $vSiti souborů je na síťovém disku, kde Koš neexistuje. " +
-                   'Ty se smažou natrvalo.'
-    }
-
     if ([System.Windows.Forms.MessageBox]::Show($zprava, 'Smazat duplicity', 'YesNo', 'Warning') -ne 'Yes') { return }
     if ($trvale) {
         if ([System.Windows.Forms.MessageBox]::Show(
@@ -666,23 +698,45 @@ function Invoke-DeleteDuplicates {
             'Smazat duplicity', 'YesNo', 'Warning') -ne 'Yes') { return }
     }
 
+    $operationLock = $null
+    try {
+        $operationLock = Enter-MediaToolLock $LogDir
+        Resolve-PendingJournalsCore $LogDir
+    } catch {
+        if ($operationLock) { $operationLock.Dispose() }
+        [System.Windows.Forms.MessageBox]::Show(
+            "Mazání nelze bezpečně zahájit: $($_.Exception.Message)", 'MediaTool', 'OK', 'Error') | Out-Null
+        return
+    }
+
     Set-Busy $true 'Mažu...'
     $pb.Value = 0; $pb.Maximum = $todo.Count; $pb.Visible = $true
-
+    $log = Join-Path $LogDir ('smazano-{0:yyyyMMdd-HHmmss}-{1}.csv' -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $pending = "$log.delete.json"
     $smazano = New-Object System.Collections.Generic.List[object]
-    $chyby   = New-Object System.Collections.Generic.List[string]
+    $chyby = New-Object System.Collections.Generic.List[string]
     $n = 0
-    foreach ($t in $todo) {
-        $n++
-        # Nahled muze byt stary: tesne pred smazanim overit, ze ponechana kopie existuje
-        # a u shodnych dat ma stejny obsah. Bez toho mohly zmizet vsechny kopie.
-        try {
-            $radekPlanu = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
-                          Select-Object -First 1
-            $proc = Test-DuplicateDeletable -Zdroj $t.Zdroj -Ponechat $radekPlanu.Ponechat -Typ $radekPlanu.Typ
-            if ($proc) {
-                $chyby.Add("$(Split-Path $t.Zdroj -Leaf): NESMAZANO - $proc")
-            } elseif (Test-Path -LiteralPath $t.Zdroj) {
+    try {
+        foreach ($t in $todo) {
+            $n++
+            try {
+                $radekPlanu = @($script:Plan | Where-Object { $_.Akce -eq 'DUPLICITA' -and $_.Zdroj -eq $t.Zdroj }) |
+                              Select-Object -First 1
+                $proc = Test-DuplicateDeletable -Zdroj $t.Zdroj -Ponechat $radekPlanu.Ponechat -Typ $radekPlanu.Typ
+                if ($proc) { throw "NESMAZANO - $proc" }
+                $hash = (Get-FileHash -LiteralPath $t.Zdroj -Algorithm SHA256).Hash
+                if (-not (Test-RecordedHash $radekPlanu.Ponechat $hash)) {
+                    throw 'NESMAZANO - ponechaná kopie se změnila'
+                }
+                $row = [pscustomobject]@{
+                    Cas = (Get-Date).ToString('o'); Zdroj = $t.Zdroj; MB = $t.MB
+                    Zpusob = $(if ($trvale) { 'trvale' } else { 'kos' })
+                    Hash = $hash; Ponechat = $radekPlanu.Ponechat
+                }
+                Write-PendingRecord $pending ([pscustomobject]@{
+                    Version = 1; Source = $t.Zdroj; Target = $radekPlanu.Ponechat
+                    Hash = $hash; Row = $row
+                })
                 if ($trvale) {
                     Remove-Item -LiteralPath $t.Zdroj -Force
                 } else {
@@ -691,26 +745,29 @@ function Invoke-DeleteDuplicates {
                         [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
                         [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
                 }
-                $smazano.Add([pscustomobject]@{
-                    Cas = (Get-Date).ToString('s'); Zdroj = $t.Zdroj; MB = $t.MB
-                    Zpusob = $(if ($trvale) { 'trvale' } else { 'kos' }) })
+                if ([IO.File]::Exists($t.Zdroj) -or -not (Test-RecordedHash $radekPlanu.Ponechat $hash)) {
+                    throw "Mazání skončilo nejednoznačně; záznam záměru zůstává: $pending"
+                }
+                $smazano.Add($row)
+                Save-BatchRows $log @(@(Get-BatchRows $log) + $row)
+                [IO.File]::Delete($pending)
+            } catch {
+                $chyby.Add("$(Split-Path $t.Zdroj -Leaf): $($_.Exception.Message)")
+                if ([IO.File]::Exists($pending)) { break }
             }
-        } catch { $chyby.Add("$(Split-Path $t.Zdroj -Leaf): $($_.Exception.Message)") }
-        $pb.Value = $n
-        $lblStatus.Text = "$n / $($todo.Count) - $(Split-Path $t.Zdroj -Leaf)"
-        [System.Windows.Forms.Application]::DoEvents()
+            $pb.Value = $n
+            $lblStatus.Text = "$n / $($todo.Count) - $(Split-Path $t.Zdroj -Leaf)"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch {
+        $chyby.Add("Běh mazání byl přerušen: $($_.Exception.Message)")
+    } finally {
+        $operationLock.Dispose()
+        $pb.Visible = $false
+        $uvolneno = ($smazano | Measure-Object -Property MB -Sum).Sum
+        Set-Busy $false ('Smazáno: {0} souborů, uvolněno {1:N2} GB, chyb: {2}.' -f `
+                         $smazano.Count, ($uvolneno / 1024), $chyby.Count)
     }
-
-    if ($smazano.Count -gt 0) {
-        if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-        $smazano | Export-Csv -LiteralPath (Join-Path $LogDir ('smazano-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))) `
-                   -NoTypeInformation -Encoding UTF8
-    }
-
-    $pb.Visible = $false
-    $uvolneno = ($smazano | Measure-Object -Property MB -Sum).Sum
-    Set-Busy $false ('Smazáno: {0} souborů, uvolněno {1:N2} GB, chyb: {2}.' -f `
-                     $smazano.Count, ($uvolneno / 1024), $chyby.Count)
     if ($chyby.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show(
             "Část se smazat nepodařila:`n`n" + (($chyby | Select-Object -First 15) -join "`n"),
@@ -722,6 +779,13 @@ function Invoke-DeleteDuplicates {
 function Invoke-UndoLast {
     if (-not (Test-Path -LiteralPath $LogDir)) {
         [System.Windows.Forms.MessageBox]::Show('Zatím není co vracet.', 'MediaTool', 'OK', 'Information') | Out-Null
+        return
+    }
+    try { Resolve-PendingJournals $LogDir }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Rozpracovanou dávku nelze bezpečně obnovit: $($_.Exception.Message)",
+            'MediaTool', 'OK', 'Error') | Out-Null
         return
     }
     $log = Get-ChildItem -LiteralPath $LogDir -Filter 'mediatool-*.csv' |
@@ -742,10 +806,19 @@ function Invoke-UndoLast {
 
     # Invoke-UndoBatch (jadro) oznaci davku za vracenou jen kdyz se vratilo vse.
     # Driv stacil jediny vraceny soubor a dalsi "Vratit" pak vzalo starsi davku.
-    $res = Invoke-UndoBatch -Log $log -OnProgress {
-        param($n, $total, $r)
-        $pb.Value = $n
-        [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $res = Invoke-UndoBatch -Log $log -OnProgress {
+            param($n, $total, $r)
+            $pb.Value = $n
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch {
+        $pb.Visible = $false
+        Set-Busy $false 'Vrácení bylo zastaveno.'
+        [System.Windows.Forms.MessageBox]::Show(
+            "Vrácení se nepodařilo bezpečně dokončit: $($_.Exception.Message)",
+            'MediaTool', 'OK', 'Error') | Out-Null
+        return
     }
     $ok    = $res.Restored
     $chyby = $res.Errors

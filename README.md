@@ -29,7 +29,7 @@ Přeložit znovu (třeba po změně ikony):
 3. **Náhled** — vypíše tabulku, co by se stalo, barevně podle akce
 4. Zaškrtávátky vyber řádky. **Nový název jde v tabulce rovnou přepsat**, když se
    ti nelíbí, co skript vymyslel
-5. **Provést vybrané**. Kdyby něco, **Vrátit poslední dávku** to celé vrátí
+5. **Provést vybrané**. Každý přesun má záznam záměru před změnou souboru. **Vrátit poslední dávku** ověřuje SHA-256; změněný nebo nejednoznačný soubor nechá na místě k ruční kontrole.
 
 Dvojklik na řádek otevře soubor v Průzkumníku. Řádky, které nejdou provést
 (poškozené a nedostažené soubory), jsou šedé a nezaškrtnutelné.
@@ -59,14 +59,13 @@ Tlačítko **Smazat duplicity** smaže zaškrtnuté řádky s akcí `DUPLICITA`.
 
 - **Výchozí je do Koše**, odkud je můžeš obnovit
 - Trvalé mazání se musí zapnout v nastavení a ptá se dvakrát
-- **Na síťovém disku Koš neexistuje** — mazání na NAS je vždy trvalé a okno tě
-  na to před smazáním upozorní včetně počtu takových souborů
-- Ponechané kopie se nikdy nemažou, jde jen o zaškrtnuté duplicity
+- **Mazání je zablokované, pokud je mazaný nebo ponechaný soubor na síťovém, odkazovaném či neověřeném svazku.** Duplicity tam přesuň do `_Duplicity`.
+- Automaticky lze mazat jen bajtově shodné duplicity po úplném ověření SHA-256 obou souborů. Různé verze stejného dílu zůstávají k ručnímu posouzení.
 - Smazání se zapisuje do `logs\smazano-*.csv`, ale **„Vrátit poslední dávku"
-  ho vrátit neumí** — přesuny ano, smazané soubory hledej v Koši
+  ho vrátit neumí** — přesuny ano; soubory poslané do Koše obnovuj z Koše,
+  trvale smazané soubory aplikace neobnoví
 
-Okno i příkazová řádka sdílejí stejný engine i stejný log, takže dávku spuštěnou
-v GUI vrátíš i přes `.\media-tool.ps1 undo -Apply` a naopak.
+Okno i příkazová řádka sdílejí stejný engine i stejný log. Nové přesuny mají trvalý záměr před změnou souboru a SHA-256 v CSV. Staré CSV bez otisku se automaticky nevrací, protože nelze ověřit totožnost cíle. Vedle `media-tool.ps1` musí ležet také `media-tool-journal.ps1`; spouštěcí exe se znovu překládat nemusí.
 
 ## Příkazová řádka
 
@@ -101,9 +100,9 @@ Nezačínej celým Downloads. Nejdřív jeden seriál, ať vidíš výsledek:
 .\media-tool.ps1 sort -Filter Bluey -Library "Z:\video" -Apply   # ostře
 ```
 
-Teprve pak zbytek. Kopie na NAS jde přes ověření velikosti — zdroj se maže
-až když cíl sedí. Při přerušeném přenosu zůstane v cíli soubor `.mtpart`,
-který se dá smazat.
+Teprve pak zbytek. Kopie na NAS se ověřuje délkou i úplným SHA-256 — zdroj se maže
+až když cíl sedí. Při přerušeném přenosu aplikace při dalším spuštění ověří zdroj
+a uklidí svou vlastní nedokončenou `.mtpart` kopii podle uloženého záměru.
 
 ## Výsledná struktura
 
